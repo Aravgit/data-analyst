@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+python-multipart
+openai>=1.55.0
+pandas
+numpy
+pyarrow
