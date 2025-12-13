@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, AsyncIterator
 
@@ -64,4 +65,3 @@ class Dispatcher:
                     err_evt = Event(op.session_id, "error", {"message": str(exc)})
                     for q in self.listeners.get(op.session_id, []):
                         await q.put(err_evt)
-

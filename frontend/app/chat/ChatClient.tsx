@@ -8,6 +8,8 @@ import { Card } from "../../components/ui/card";
 import { cn } from "../../lib/utils";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { decryptPayload } from "../../lib/decrypt";
+import PaginatedTable from "../../components/ui/paginated-table";
 
 type Role = "user" | "assistant" | "status" | "error";
 type Message = { role: Role; content: string };
@@ -16,6 +18,23 @@ type UploadResponse = { session_id: string; csv_name: string; path: string };
 type ChatResponse = { session_id: string; reply: string; total_tokens: number; status: string };
 
 const apiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+
+type DataFrameEvent = {
+  df_name: string;
+  logical_name?: string;
+  columns: string[];
+  rows: any[];
+  row_count?: number;
+  dtypes?: Record<string, string>;
+};
+
+type DownloadEvent = {
+  df_name: string;
+  logical_name?: string;
+  rows?: number;
+  columns?: number;
+  path: string;
+};
 
 export default function ChatClient() {
   const search = useSearchParams();
@@ -39,6 +58,9 @@ export default function ChatClient() {
   const [uploading, setUploading] = useState(false);
   const [streamingAssistant, setStreamingAssistant] = useState<{ idx: number; text: string } | null>(null);
   const [csvName, setCsvName] = useState<string>("");
+  const [dataFrames, setDataFrames] = useState<DataFrameEvent[]>([]);
+  const [downloads, setDownloads] = useState<DownloadEvent[]>([]);
+  const [activeTab, setActiveTab] = useState<"summary" | "data">("summary");
 
   useEffect(() => {
     const qsSession = search.get("session");
@@ -130,9 +152,9 @@ export default function ChatClient() {
         buffer += decoder.decode(value, { stream: true });
         const parts = buffer.split("\n\n");
         buffer = parts.pop() || "";
-        for (const part of parts) handleSseEvent(part);
+        for (const part of parts) await handleSseEvent(part);
       }
-      if (buffer.trim().length) handleSseEvent(buffer);
+      if (buffer.trim().length) await handleSseEvent(buffer);
     } catch (err: any) {
       push({ role: "error", content: err?.message || "Agent error." });
       appendActivity("error", err?.message || "Agent error.");
@@ -142,7 +164,7 @@ export default function ChatClient() {
     }
   }
 
-  function handleSseEvent(block: string) {
+  async function handleSseEvent(block: string) {
     const lines = block.split("\n");
     let event = "message";
     let data = "";
@@ -204,6 +226,38 @@ export default function ChatClient() {
     if (event === "error") {
       push({ role: "error", content: payload.message || "Agent error." });
       appendActivity("error", payload.message || "Agent error.");
+      return;
+    }
+    if (event === "data_frame") {
+      try {
+        const raw = payload?.payload ?? payload;
+        const parsed = typeof raw === "string" ? decryptPayload(raw) : raw;
+        if (!parsed || !Array.isArray(parsed.columns) || !Array.isArray(parsed.rows)) {
+          appendActivity("error", "Bad data_frame payload");
+          return;
+        }
+        setDataFrames((prev) => {
+          const filtered = prev.filter((p) => p.df_name !== parsed.df_name);
+          return [parsed as DataFrameEvent, ...filtered].slice(0, 5);
+        });
+        appendActivity("data", `Table ${parsed.df_name || "df"} (${parsed.row_count || parsed.rows?.length || 0} rows)`);
+      } catch (err: any) {
+        appendActivity("error", "Failed to decrypt table");
+      }
+      return;
+    }
+    if (event === "data_download") {
+      try {
+        const raw = payload?.payload ?? payload;
+        const parsed = typeof raw === "string" ? decryptPayload(raw) : raw;
+        setDownloads((prev) => {
+          const filtered = prev.filter((p) => p.path !== parsed.path);
+          return [parsed as DownloadEvent, ...filtered].slice(0, 10);
+        });
+        appendActivity("data", `Download ready: ${parsed.logical_name || parsed.df_name || "table"}`);
+      } catch (err: any) {
+        appendActivity("error", "Failed to decrypt download info");
+      }
       return;
     }
   }
@@ -285,17 +339,50 @@ export default function ChatClient() {
           </div>
 
           <div className="flex flex-col gap-3">
-            <div className="min-h-[620px] max-h-[860px] space-y-3 overflow-y-auto rounded-xl border border-slate-200 bg-white p-4 shadow-inner">
-              {messages.map((m, idx) => (
-                <div key={idx} className={cn(bubble(m.role), m.role === "user" ? "text-right" : "text-left")}>
-                  <div className="mb-1 text-[11px] uppercase tracking-wide text-slate-500">{badge(m.role)}</div>
-                  <div className="prose prose-sm prose-slate max-w-none text-slate-900">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
-                  </div>
+            <div className="space-y-3">
+              <div className="grid w-full grid-cols-2 rounded-md border border-slate-200 bg-slate-50">
+                <button
+                  onClick={() => setActiveTab("summary")}
+                  className={cn(
+                    "py-2 text-sm font-semibold",
+                    activeTab === "summary" ? "bg-white text-slate-900 shadow-inner" : "text-slate-600"
+                  )}
+                >
+                  Summary
+                </button>
+                <button
+                  onClick={() => setActiveTab("data")}
+                  className={cn(
+                    "py-2 text-sm font-semibold",
+                    activeTab === "data" ? "bg-white text-slate-900 shadow-inner" : "text-slate-600"
+                  )}
+                >
+                  Data
+                </button>
+              </div>
+
+              {activeTab === "summary" && (
+                <div className="min-h-[620px] max-h-[860px] space-y-3 overflow-y-auto rounded-xl border border-slate-200 bg-white p-4 shadow-inner">
+                  {messages.map((m, idx) => (
+                    <div key={idx} className={cn(bubble(m.role), m.role === "user" ? "text-right" : "text-left")}>
+                      <div className="mb-1 text-[11px] uppercase tracking-wide text-slate-500">{badge(m.role)}</div>
+                      <div className="prose prose-sm prose-slate max-w-none text-slate-900">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
+                      </div>
+                    </div>
+                  ))}
+                  {messages.length === 0 && (
+                    <div className="text-sm text-slate-500">No messages yet - upload and ask a question.</div>
+                  )}
                 </div>
-              ))}
-              {messages.length === 0 && (
-                <div className="text-sm text-slate-500">No messages yet - upload and ask a question.</div>
+              )}
+
+              {activeTab === "data" && (
+                dataFrames.length === 0 ? (
+                  <div className="rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-600">No data yet.</div>
+                ) : (
+                  <PaginatedTable frame={dataFrames[0]} download={downloads[0]} />
+                )
               )}
             </div>
 
@@ -348,6 +435,19 @@ export default function ChatClient() {
                   <span>{a.detail}</span>
                 </div>
               ))}
+              {downloads.length > 0 && (
+                <div className="rounded-md border border-slate-200 bg-white px-2 py-2">
+                  <div className="text-[10px] uppercase tracking-wide text-slate-500 mb-1">Downloads</div>
+                  <div className="space-y-1">
+                    {downloads.map((d, idx) => (
+                      <div key={idx} className="text-xs">
+                        <span className="font-semibold">{d.logical_name || d.df_name || "table"}</span>:{" "}
+                        <code className="bg-slate-50 px-1 rounded">{d.path}</code>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </Card>

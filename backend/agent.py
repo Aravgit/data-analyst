@@ -3,12 +3,14 @@ import logging
 from typing import Dict, Any, Optional, List, Iterable
 import os
 import asyncio
+from pathlib import Path
 from openai import OpenAI, AsyncOpenAI
 from openai.types.responses import Response
 
 from session import SessionState
 from pydantic import BaseModel
 from tools import TOOL_REGISTRY, TOOLING_SPEC, safe_tool_output
+from data_events import make_data_frame_event, encrypt_payload
 
 MODEL = "gpt-5.1"
 REASONING_EFFORT = "medium"
@@ -16,6 +18,7 @@ TOKEN_LIMIT = 100000  # combined input + output (budget before auto-compaction)
 MAX_API_RETRIES = 3
 # Streaming of partial chunks is temporarily disabled; we emit only final replies.
 USE_STREAMING = bool(int(os.getenv("ENABLE_RESPONSES_STREAMING", "0")))
+DATA_ROOT = Path(os.environ.get("DATA_ROOT", "./data")).resolve()
 
 logger = logging.getLogger("csv_agent")
 
@@ -108,6 +111,34 @@ def compact_session(
     return summary
 
 
+def _extract_data_event(result: Any, session: SessionState) -> Optional[Dict[str, Any]]:
+    if not isinstance(result, dict):
+        return None
+    if result.get("kind") != "dataframe":
+        return None
+
+    df_name = result.get("df_name", "df")
+    logical = result.get("logical_name") or df_name
+    df = session.python.globals.get(df_name)
+    if df is not None:
+        try:
+            evts, _ = make_data_frame_event(df, df_name, session.session_id, logical, DATA_ROOT)
+            return evts[0] if evts else None
+        except Exception:
+            return None
+
+    head = result.get("head") or []
+    payload = {
+        "df_name": df_name,
+        "logical_name": logical,
+        "columns": result.get("columns") or [],
+        "rows": head,
+        "row_count": result.get("row_count"),
+        "dtypes": result.get("dtypes") or {},
+    }
+    return {"type": "data_frame", "payload": encrypt_payload(payload)}
+
+
 def run_agent_turn(
     session: SessionState, user_message: str, max_turns: int = 12
 ) -> Dict[str, Any]:
@@ -132,6 +163,7 @@ def run_agent_turn(
     reply_tokens = 0
     turn_input_tokens = 0
     turn_output_tokens = 0
+    last_data_event: Optional[Dict[str, Any]] = None
 
     while turns < max_turns:
         turns += 1
@@ -312,6 +344,13 @@ def run_agent_turn(
                     }
                 )
 
+                try:
+                    evt = _extract_data_event(result, session)
+                    if evt:
+                        last_data_event = evt
+                except Exception:
+                    logger.exception("data event extraction failed", extra={"session_id": session.session_id})
+
                 logger.info(
                     "tool result",
                     extra={
@@ -391,6 +430,7 @@ def run_agent_turn(
         "input_tokens": turn_input_tokens,
         "output_tokens": turn_output_tokens,
         "status": status,
+        "data_events": [last_data_event] if last_data_event else [],
     }
 
 
@@ -421,6 +461,7 @@ async def run_agent_turn_async(
     reply_sent = False
     over_limit_after_turn = False
     reply_tokens = 0
+    last_data_event: Optional[Dict[str, Any]] = None
 
     while turns < max_turns:
         turns += 1
@@ -579,6 +620,13 @@ async def run_agent_turn_async(
                 )
                 yield {"type": "tool_result", "call_id": call_id, "result_kind": result.get("kind") if isinstance(result, dict) else None}
 
+                try:
+                    evt = _extract_data_event(result, session)
+                    if evt:
+                        last_data_event = evt
+                except Exception:
+                    logger.exception("data event extraction failed", extra={"session_id": session.session_id})
+
             session.messages.extend(function_results)
             continue
 
@@ -597,6 +645,8 @@ async def run_agent_turn_async(
         if not reply_text.strip():
             reply_text = "No content returned."
         session.messages.append({"role": "assistant", "content": reply_text})
+        if last_data_event:
+            yield {"type": last_data_event.get("type"), "payload": last_data_event.get("payload")}
         yield {"type": "reply", "text": reply_text, "status": "ok", "total_tokens": reply_tokens}
         reply_sent = True
         break
@@ -614,19 +664,18 @@ async def run_agent_turn_async(
 
 def system_prompt() -> str:
     return (
-        "System Instrutions:"
         "You are Codex, a coding/data agent, developed by Actalyst. Apply these rules:\n"
-        "Answer only questions related to the data provided to you. Do not make up any information or answer questions that are not related to the data provided to you. Ask the user to refine the question if it is not related to the data provided to you.\n"
-        "- Use tools for computation or data access; prefer python_repl for analysis. Discover CSV names with list_csv_files. First, inspect with load_csv_sample (nrows default 200). When ready, use load_csv_columns to load all rows of just the needed columns. Use load_csv_handle only if you must load the entire table.\n"
-        "- Always format summaries and final answers in Markdown (headings, lists, tables where helpful).\n"
-        "-Always give numerical data in table markdown format"
-        "- Batch tool calls when possible; multiple function_call outputs are allowed. Provide the minimal set of calls to answer the user.\n"
-        "- Keep messages concise; highlight results, not raw code (unless the user asks).\n"
-        "- When a tool fails, report the error briefly and propose a fix or alternative.\n"
+        "- Answer only questions related to the provided data; ask for refinement if unclear.\n"
+        "- Use tools for computation/data access; prefer python_repl for analysis. Discover CSV names with list_csv_files. First inspect with load_csv_sample (nrows default 200). When ready, use load_csv_columns to load all rows of just the needed columns. Use load_csv_handle only if you must load the entire table.\n"
+        "- Tables are delivered to the UI via data_frame/data_download events. Never paste large tables in your final message. Include a Markdown table only when the result has 20 rows or fewer; otherwise summarize with aggregates and say the data is too large to inline, suggesting helpful aggregations/filters.\n"
+        "- Keep messages concise; highlight findings and aggregates, not code.\n"
+        "- When a tool fails, report briefly and propose a fix.\n"
         "- Stop calling tools once you have the answer.\n"
         "- Default to ASCII; avoid non-essential Unicode.\n"
-        "-When you do not have the answer, or need more information, you should ask the user for more information or clarify the question.\n"
-        "-When column required for analysis is not present, ask the user to provide the column name/calrification - share the most relevant column for clarification\n"
-        "-Derived columns created via computations on loaded data are allowed; never fabricate data or values that are not present or computed from the provided data.\n"
-        "-For each questons you have to assess the columns required by reading the sample data, do not use columns of previous unless they are connected or you have all the columns handy"
+        "- Ask for missing info or column names when needed; suggest the most relevant column.\n"
+        "- Derived columns from computations are allowed; never fabricate data.\n"
+        "- For each question, assess required columns from current context; do not reuse old columns unless relevant or loaded.\n"
+        "- In final summaries use Markdown with headings/bullets; include a small table only when <=20 rows; otherwise omit tables and point to the Data tab or suggest grouping/filtering to reduce size.\n"
+        "   - The summary should essentially capture and answer the user question or clarify requirements etc. Do'nt say The full table is available in the Data tab as 'OCT-25-26 cost by business unit', etc."
+        "- The data tab shows full results via events(but don't say that in summary); the text summary is reserved for small outputs. Before replying, emit the final analysis dataframe via data_frame (use send_data_to_ui_as_df on your final df). If a result exceeds 20 rows, avoid inlining and recommend an aggregation (e.g., by category or time) to shrink it."
     )

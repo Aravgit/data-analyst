@@ -3,6 +3,8 @@ import datetime
 import decimal
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
+from pathlib import Path
+import os
 
 import numpy as np
 import pandas as pd
@@ -141,6 +143,25 @@ def load_csv_columns_schema() -> Dict[str, Any]:
     }
 
 
+def send_df_to_ui_schema() -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "name": "send_data_to_ui_as_df",
+        "description": "Emit an existing DataFrame (by name) to the UI as the final data table.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "df_name": {"type": "string", "description": "Name of DataFrame variable in the REPL"},
+                "logical_name": {"type": "string", "description": "Label to show in UI", "default": "df"},
+            },
+            # Strict schemas must list every property in required
+            "required": ["df_name", "logical_name"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    }
+
+
 def load_csv_into_session(session: SessionState, name: str, df_name: str) -> Dict[str, Any]:
     path = session.csv_registry.get(name)
     if not path:
@@ -151,7 +172,36 @@ def load_csv_into_session(session: SessionState, name: str, df_name: str) -> Dic
         except MemoryError as exc:
             return {"kind": "error", "traceback": f"MemoryError loading CSV (sandbox ~1GB): {exc}"}
         session.python.globals[df_name] = df
-        return {"kind": "text", "text": f"Loaded {name} into {df_name} ({len(df)} rows)."}
+        return {
+            "kind": "dataframe",
+            "text": f"Loaded {name} into {df_name} ({len(df)} rows).",
+            "df_name": df_name,
+            "logical_name": name,
+            "head": df.head(50).to_dict(orient="records"),
+            "row_count": int(len(df)),
+            "columns": list(df.columns),
+            "dtypes": {c: str(t) for c, t in df.dtypes.items()},
+        }
+    except Exception as exc:
+        return {"kind": "error", "traceback": repr(exc)}
+
+
+def send_df_to_ui_as_df(session: SessionState, df_name: str, logical_name: str = "df") -> Dict[str, Any]:
+    df = session.python.globals.get(df_name)
+    if df is None:
+        return {"kind": "error", "traceback": f"DataFrame '{df_name}' not found."}
+    try:
+        head = df.head(50).to_dict(orient="records")
+        return {
+            "kind": "dataframe",
+            "text": f"Sent dataframe {df_name} to UI as {logical_name}. Rows: {len(df)}.",
+            "df_name": df_name,
+            "logical_name": logical_name,
+            "head": head,
+            "row_count": int(len(df)),
+            "columns": list(df.columns),
+            "dtypes": {c: str(t) for c, t in df.dtypes.items()},
+        }
     except Exception as exc:
         return {"kind": "error", "traceback": repr(exc)}
 
@@ -164,7 +214,16 @@ def load_csv_sample(session: SessionState, name: str, df_name: str = "df_sample"
     try:
         df = pd.read_csv(path, nrows=n, low_memory=True)
         session.python.globals[df_name] = df
-        return {"kind": "text", "text": f"Loaded sample of {n} rows from {name} into {df_name}."}
+        return {
+            "kind": "dataframe",
+            "text": f"Loaded sample of {n} rows from {name} into {df_name}.",
+            "df_name": df_name,
+            "logical_name": name,
+            "head": df.head(50).to_dict(orient="records"),
+            "row_count": int(len(df)),
+            "columns": list(df.columns),
+            "dtypes": {c: str(t) for c, t in df.dtypes.items()},
+        }
     except Exception as exc:
         return {"kind": "error", "traceback": repr(exc)}
 
@@ -180,9 +239,16 @@ def load_csv_columns(
     try:
         df = pd.read_csv(path, usecols=columns, low_memory=True)
         session.python.globals[df_name] = df
-        msg = f"Loaded columns {columns} from {name} into {df_name}"
-        msg += f". Rows loaded: {len(df)}."
-        return {"kind": "text", "text": msg}
+        return {
+            "kind": "dataframe",
+            "text": f"Loaded columns {columns} from {name} into {df_name}. Rows loaded: {len(df)}.",
+            "df_name": df_name,
+            "logical_name": name,
+            "head": df.head(50).to_dict(orient="records"),
+            "row_count": int(len(df)),
+            "columns": list(df.columns),
+            "dtypes": {c: str(t) for c, t in df.dtypes.items()},
+        }
     except Exception as exc:
         return {"kind": "error", "traceback": repr(exc)}
 
@@ -215,6 +281,11 @@ TOOL_REGISTRY: Dict[str, Tool] = {
         "load_csv_columns",
         load_csv_columns_schema(),
         lambda s, a: load_csv_columns(s, a.get("name", ""), a.get("columns", []), a.get("df_name", "df")),
+    ),
+    "send_data_to_ui_as_df": Tool(
+        "send_data_to_ui_as_df",
+        send_df_to_ui_schema(),
+        lambda s, a: send_df_to_ui_as_df(s, a.get("df_name", ""), a.get("logical_name", "df")),
     ),
 }
 

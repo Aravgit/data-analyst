@@ -79,7 +79,7 @@ def serialize_value(value: Any) -> Dict[str, Any]:
         return {"kind": "text", "text": "Code executed. No return value."}
 
     if isinstance(value, pd.DataFrame):
-        head_df = value.head(20)
+        head_df = value.head(50)
         head_records = head_df.to_dict(orient="records")
         return {
             "kind": "dataframe",
@@ -89,6 +89,26 @@ def serialize_value(value: Any) -> Dict[str, Any]:
             "row_count": int(len(value)),
             "meta": {"dtypes": {c: str(t) for c, t in value.dtypes.items()}},
         }
+
+    if isinstance(value, pd.Series):
+        df = value.reset_index()
+        df.columns = ["index", "value"]
+        return serialize_value(df)
+
+    if isinstance(value, dict):
+        df = pd.DataFrame(list(value.items()), columns=["key", "value"])
+        return serialize_value(df)
+
+    if isinstance(value, (list, tuple)):
+        df = pd.DataFrame(value)
+        return serialize_value(df)
+
+    # Fallback: wrap scalar into a 1-row dataframe for consistent table output
+    try:
+        df = pd.DataFrame([{"value": value}])
+        return serialize_value(df)
+    except Exception:
+        pass
 
     try:
         import json

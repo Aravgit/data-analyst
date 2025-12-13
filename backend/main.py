@@ -12,6 +12,7 @@ from starlette.responses import StreamingResponse
 from agent import run_agent_turn, run_agent_turn_async
 from session import SessionStore
 from dispatcher import Dispatcher, Op, Event
+import shutil
 
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", "./data")).resolve()
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
@@ -116,6 +117,7 @@ async def chat(req: ChatRequest):
         "reply": result["reply"],
         "total_tokens": result["total_tokens"],
         "status": result["status"],
+        "data_events": result.get("data_events", []),
     }
 
 
@@ -130,6 +132,8 @@ async def chat_stream(req: ChatRequest):
         yield sse_event("status", "start")
         # Use synchronous agent to avoid partial-stream issues
         result = run_agent_turn(session, req.message)
+        for evt in result.get("data_events", []):
+            yield sse_event(evt.get("type", "data_frame"), json.dumps({"payload": evt.get("payload")}))
         yield sse_event(
             "token_usage",
             json.dumps(
@@ -157,6 +161,9 @@ async def chat_stream(req: ChatRequest):
 @app.post("/reset")
 async def reset(session_id: str):
     store.reset(session_id)
+    exports_dir = DATA_ROOT / session_id / "exports"
+    if exports_dir.exists():
+        shutil.rmtree(exports_dir, ignore_errors=True)
     return {"session_id": session_id, "reset": True}
 
 
@@ -187,6 +194,8 @@ async def handle_op(op: Op):
                 events.append(Event(session.session_id, "partial", {"text": ev.get("text")}))
             elif etype == "error":
                 events.append(Event(session.session_id, "error", {"message": ev["message"]}))
+            elif etype in ("data_frame", "data_download"):
+                events.append(Event(session.session_id, etype, {"payload": ev.get("payload")}))
     return events
 
 
