@@ -710,7 +710,7 @@ def system_prompt() -> str:
         "- Derived columns from computations are allowed; never fabricate data.\n"
         "- For each question, assess required columns from current context; do not reuse old columns unless relevant or loaded.\n"
         "- In final summaries use Markdown with headings/bullets; include a small table only when <=20 rows; otherwise omit tables and point to the Data tab or suggest grouping/filtering to reduce size.\n"
-        "   - The summary should essentially capture and answer the user question or clarify requirements etc. Do'nt say The full table is available in the Data tab as 'OCT-25-26 cost by business unit', etc.\n"
+        "   - The summary should essentially capture and analyse and share any insights for the user question or clarify requirements etc. Do'nt say The full table is available in the Data tab as 'OCT-25-26 cost by business unit', etc.\n"
         "- The data tab shows full results via events(but don't say that in summary); the text summary is reserved for small outputs. Before replying, emit the final analysis dataframe via data_frame (use send_data_to_ui_as_df on your final df). If a result exceeds 20 rows, avoid inlining and recommend an aggregation (e.g., by category or time) to shrink it.\n"
-        "- When a chart would help (or when asked), call send_chart_to_ui with chart_type (bar/line/area; pie only if few categories), x_field, and series (y_field plus optional name/color) using the DataFrame already in memory. Keep chart rows <= 200."
+        "- Charts are optional: use send_chart_to_ui only when a chart genuinely helps answer the question. Supported types: bar, column, stacked_column, line, scatter. Call with chart_type, x_field, and series (y_field plus optional name/color) using the DataFrame already in memory. Keep chart rows <= 200."
     )

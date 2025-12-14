@@ -42,8 +42,10 @@ type DownloadEvent = {
 type ChartSeries = { name: string; y_field: string; color?: string };
 type ChartPayload = {
   title?: string;
-  chart_type: "bar" | "line" | "area" | "pie";
+  chart_type: "bar" | "column" | "stacked_column" | "line" | "scatter";
   x_field: string;
+  x_label?: string;
+  y_label?: string;
   series: ChartSeries[];
   data: any[];
   note?: string;
@@ -349,12 +351,17 @@ export default function ChatClient() {
           .filter((s: any) => s && s.y_field)
           .map((s: any) => ({ name: s.name || s.y_field, y_field: s.y_field, color: s.color }))
       : [];
+    const allowedTypes = ["bar", "column", "stacked_column", "line", "scatter"];
     if (!chart_type || !x_field || series.length === 0) return { ok: false, reason: "missing chart fields" };
+    if (!allowedTypes.includes(chart_type)) return { ok: false, reason: `unsupported chart_type '${chart_type}'` };
+    if (chart_type === "scatter" && series.length !== 1) return { ok: false, reason: "scatter requires exactly one series" };
     return {
       ok: true,
       chart: {
         chart_type,
         x_field,
+        x_label: raw.x_label,
+        y_label: raw.y_label,
         series,
         data,
         title: raw.title,
@@ -478,7 +485,7 @@ export default function ChatClient() {
               {activeTab === "charts" && (
                 charts.length === 0 ? (
                   <div className="rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-600">
-                    No charts yet. Ask for a bar or line chart after loading data.
+                    No charts yet. Ask for a bar, column, stacked column, line, or scatter chart after loading data.
                   </div>
                 ) : (
                   <div className="space-y-3 rounded-xl border border-slate-200 bg-white p-4">

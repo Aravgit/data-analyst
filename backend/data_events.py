@@ -12,10 +12,9 @@ ROW_THRESHOLD = int(os.getenv("DATA_EVENT_ROW_THRESHOLD", "5000"))
 INLINE_ROW_LIMIT = int(os.getenv("DATA_EVENT_INLINE_ROWS", "200"))
 EXPORT_DIR_NAME = "exports"
 
-ALLOWED_CHART_TYPES = {"bar", "line", "area", "pie"}
+ALLOWED_CHART_TYPES = {"bar", "column", "stacked_column", "line", "scatter"}
 MAX_CHART_ROWS = 200
 MAX_CHART_SERIES = 10
-MAX_PIE_CATEGORIES = 8
 
 
 def _fernet_from_key(secret: Optional[str]):
@@ -124,6 +123,8 @@ def make_chart_event(
         return [], "series required"
     if len(series) > MAX_CHART_SERIES:
         return [], f"too many series ({len(series)})"
+    if chart_type == "scatter" and len(series) != 1:
+        return [], "scatter charts require exactly one series"
 
     for s in series:
         if not isinstance(s, dict) or not s.get("y_field"):
@@ -146,8 +147,8 @@ def make_chart_event(
     # limit rows
     src_df = src_df.head(MAX_CHART_ROWS)
 
-    # validation: numeric y for non-pie
-    if chart_type in ("bar", "line", "area"):
+    # validation: numeric y for cartesian charts
+    if chart_type in ("bar", "column", "stacked_column", "line", "scatter"):
         for s in series:
             y = s.get("y_field")
             try:
@@ -155,16 +156,30 @@ def make_chart_event(
             except Exception:
                 return [], f"y_field '{y}' not numeric"
 
-    if chart_type == "pie":
-        unique_cats = src_df[x_field].nunique(dropna=True)
-        if unique_cats > MAX_PIE_CATEGORIES:
-            return [], f"too many pie categories ({unique_cats})"
+    # scatter requires numeric x as well
+    if chart_type == "scatter":
+        try:
+            pd.to_numeric(src_df[x_field])
+        except Exception:
+            return [], f"x_field '{x_field}' not numeric for scatter"
+
+    x_label = chart_spec.get("x_label")
+    y_label = chart_spec.get("y_label")
 
     payload = {
         "title": chart_spec.get("title"),
         "chart_type": chart_type,
         "x_field": x_field,
-        "series": [{"name": s.get("name") or s.get("y_field"), "y_field": s.get("y_field"), "color": s.get("color")} for s in series],
+        "x_label": x_label,
+        "y_label": y_label,
+        "series": [
+            {
+                "name": s.get("name") or s.get("y_field"),
+                "y_field": s.get("y_field"),
+                "color": s.get("color"),
+            }
+            for s in series
+        ],
         "data": src_df[needed_cols].to_dict(orient="records"),
         "note": chart_spec.get("note"),
         "df_name": chart_spec.get("df_name"),

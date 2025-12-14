@@ -26,6 +26,34 @@
 - Provide concise, action-oriented descriptions; include constraints/expected outputs.
 - Add examples in the system prompt if the tool is complex.
 
+### Strict tool schemas (OpenAI Responses)
+- When `strict: true`, OpenAI requires the `required` array to list **every** property that appears in `properties`. If you omit any property from `required`, the schema is rejected with `"required is required to be supplied and to be an array including every key in properties"`.
+- To keep optional fields, give them safe defaults and still include them in `required` (the model must send them; defaults are only for validation).
+- Example (chart tool):
+  - properties: `df_name, logical_name, chart_type, x_field, x_label, y_label, series, title, note`
+  - required: all of the above, even if you treat some as optional in logic.
+  - defaults: `x_label`, `y_label`, `title`, `note` set to `""` so the model can send empty strings.
+  - Schema snippet:
+    ```json
+    {
+      "type": "object",
+      "properties": {
+        "df_name": {"type":"string"},
+        "logical_name": {"type":"string","default":""},
+        "chart_type": {"type":"string","enum":["bar","column","stacked_column","line","scatter"]},
+        "x_field": {"type":"string"},
+        "x_label": {"type":"string","default":""},
+        "y_label": {"type":"string","default":""},
+        "series": {"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"y_field":{"type":"string"}},"required":["name","y_field"],"additionalProperties":false},"minItems":1,"maxItems":10},
+        "title": {"type":"string","default":""},
+        "note": {"type":"string","default":""}
+      },
+      "required": ["df_name","logical_name","chart_type","x_field","x_label","y_label","series","title","note"],
+      "additionalProperties": false
+    }
+    ```
+- Update the system prompt/instructions so the model knows to always supply those fields (empty string is fine for optional ones).
+
 ## Handling function calls (Responses API)
 - Detect calls: iterate all `response.output` items; collect any with `type == "function_call"`.
 - Execute functions safely; validate/parse `arguments` JSON; on parse error, return a friendly error string to the model.

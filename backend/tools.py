@@ -147,18 +147,24 @@ def send_chart_to_ui_schema() -> Dict[str, Any]:
     return {
         "type": "function",
         "name": "send_chart_to_ui",
-        "description": "Emit a chart spec for an existing DataFrame to the UI (bar/line/area/pie). Use after computing aggregates.",
+        "description": "Emit a chart spec for an existing DataFrame to the UI (bar/column/stacked_column/line/scatter). Use only when a chart helps the user understand the result.",
         "parameters": {
             "type": "object",
             "properties": {
                 "df_name": {"type": "string", "description": "Name of DataFrame in the REPL"},
-                "logical_name": {"type": "string", "description": "Label to show in UI"},
+                "logical_name": {
+                    "type": "string",
+                    "description": "Label to show in UI",
+                    "default": "",
+                },
                 "chart_type": {
                     "type": "string",
-                    "enum": ["bar", "line", "area", "pie"],
-                    "description": "Chart type (prefer bar/line; pie only for few categories)",
+                    "enum": ["bar", "column", "stacked_column", "line", "scatter"],
+                    "description": "Chart type (bar/column/stacked_column/line/scatter only)",
                 },
                 "x_field": {"type": "string", "description": "Column for x-axis or category"},
+                "x_label": {"type": "string", "description": "Optional label for the x-axis", "default": ""},  # strict schema needs default
+                "y_label": {"type": "string", "description": "Optional label for the y-axis", "default": ""},
                 "series": {
                     "type": "array",
                     "description": "List of series (y values) to plot",
@@ -174,13 +180,23 @@ def send_chart_to_ui_schema() -> Dict[str, Any]:
                     "minItems": 1,
                     "maxItems": 10,
                 },
-                "title": {"type": "string", "description": "Optional title"},
-                "note": {"type": "string", "description": "Optional short note/footnote"},
+                "title": {"type": "string", "description": "Optional title", "default": ""},
+                "note": {"type": "string", "description": "Optional short note/footnote", "default": ""},
             },
-            "required": ["df_name", "chart_type", "x_field", "series"],
+            "required": [
+                "df_name",
+                "logical_name",
+                "chart_type",
+                "x_field",
+                "x_label",
+                "y_label",
+                "series",
+                "title",
+                "note",
+            ],
             "additionalProperties": False,
         },
-        "strict": False,
+        "strict": True,
     }
 
 
