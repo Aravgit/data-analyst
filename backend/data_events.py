@@ -12,6 +12,11 @@ ROW_THRESHOLD = int(os.getenv("DATA_EVENT_ROW_THRESHOLD", "5000"))
 INLINE_ROW_LIMIT = int(os.getenv("DATA_EVENT_INLINE_ROWS", "200"))
 EXPORT_DIR_NAME = "exports"
 
+ALLOWED_CHART_TYPES = {"bar", "line", "area", "pie"}
+MAX_CHART_ROWS = 200
+MAX_CHART_SERIES = 10
+MAX_PIE_CATEGORIES = 8
+
 
 def _fernet_from_key(secret: Optional[str]):
     if not secret:
@@ -91,3 +96,78 @@ def make_data_frame_event(
         download_path = str(out_path)
 
     return events, download_path
+
+
+def make_chart_event(
+    df: pd.DataFrame,
+    chart_spec: Dict[str, Any],
+    session_id: str,
+    logical_name: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """
+    Build chart event from a dataframe + spec.
+    Returns (events, rejection_reason) where rejection_reason is None on success.
+    """
+    if not isinstance(chart_spec, dict):
+        return [], "chart_spec must be an object"
+
+    chart_type = str(chart_spec.get("chart_type", "")).lower()
+    x_field = chart_spec.get("x_field")
+    series = chart_spec.get("series") or []
+    data_rows = chart_spec.get("data")
+
+    if chart_type not in ALLOWED_CHART_TYPES:
+        return [], f"unsupported chart_type '{chart_type}'"
+    if not isinstance(x_field, str) or not x_field:
+        return [], "x_field required"
+    if not isinstance(series, list) or len(series) == 0:
+        return [], "series required"
+    if len(series) > MAX_CHART_SERIES:
+        return [], f"too many series ({len(series)})"
+
+    for s in series:
+        if not isinstance(s, dict) or not s.get("y_field"):
+            return [], "each series needs y_field"
+
+    # choose data source
+    if data_rows is not None and isinstance(data_rows, list):
+        src_df = pd.DataFrame(data_rows)
+    else:
+        src_df = df.copy()
+
+    if x_field not in src_df.columns:
+        return [], f"x_field '{x_field}' missing"
+
+    needed_cols = [x_field] + [s["y_field"] for s in series if isinstance(s, dict) and s.get("y_field")]
+    missing = [c for c in needed_cols if c not in src_df.columns]
+    if missing:
+        return [], f"missing columns {missing}"
+
+    # limit rows
+    src_df = src_df.head(MAX_CHART_ROWS)
+
+    # validation: numeric y for non-pie
+    if chart_type in ("bar", "line", "area"):
+        for s in series:
+            y = s.get("y_field")
+            try:
+                pd.to_numeric(src_df[y])
+            except Exception:
+                return [], f"y_field '{y}' not numeric"
+
+    if chart_type == "pie":
+        unique_cats = src_df[x_field].nunique(dropna=True)
+        if unique_cats > MAX_PIE_CATEGORIES:
+            return [], f"too many pie categories ({unique_cats})"
+
+    payload = {
+        "title": chart_spec.get("title"),
+        "chart_type": chart_type,
+        "x_field": x_field,
+        "series": [{"name": s.get("name") or s.get("y_field"), "y_field": s.get("y_field"), "color": s.get("color")} for s in series],
+        "data": src_df[needed_cols].to_dict(orient="records"),
+        "note": chart_spec.get("note"),
+        "df_name": chart_spec.get("df_name"),
+        "logical_name": logical_name,
+    }
+    return [{"type": "chart", "payload": encrypt_payload(payload)}], None

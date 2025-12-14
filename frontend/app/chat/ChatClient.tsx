@@ -6,10 +6,13 @@ import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { Card } from "../../components/ui/card";
 import { cn } from "../../lib/utils";
+import dynamic from "next/dynamic";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { decryptPayload } from "../../lib/decrypt";
 import PaginatedTable from "../../components/ui/paginated-table";
+
+const ChartCard = dynamic(() => import("../../components/ui/chart-card"), { ssr: false });
 
 type Role = "user" | "assistant" | "status" | "error";
 type Message = { role: Role; content: string };
@@ -36,6 +39,18 @@ type DownloadEvent = {
   path: string;
 };
 
+type ChartSeries = { name: string; y_field: string; color?: string };
+type ChartPayload = {
+  title?: string;
+  chart_type: "bar" | "line" | "area" | "pie";
+  x_field: string;
+  series: ChartSeries[];
+  data: any[];
+  note?: string;
+  df_name?: string;
+  logical_name?: string;
+};
+
 export default function ChatClient() {
   const search = useSearchParams();
   const router = useRouter();
@@ -60,7 +75,9 @@ export default function ChatClient() {
   const [csvName, setCsvName] = useState<string>("");
   const [dataFrames, setDataFrames] = useState<DataFrameEvent[]>([]);
   const [downloads, setDownloads] = useState<DownloadEvent[]>([]);
-  const [activeTab, setActiveTab] = useState<"summary" | "data">("summary");
+  const [charts, setCharts] = useState<ChartPayload[]>([]);
+  const [chartIdx, setChartIdx] = useState(0);
+  const [activeTab, setActiveTab] = useState<"summary" | "data" | "charts">("summary");
 
   useEffect(() => {
     const qsSession = search.get("session");
@@ -102,6 +119,8 @@ export default function ChatClient() {
         setMessages([{ role: "assistant", content: "Upload a CSV to begin, then ask me anything about it." }]);
         setActivity([]);
         setInput("");
+        setCharts([]);
+        setChartIdx(0);
       }
 
       const searchParams = new URLSearchParams({ session: data.session_id, csv: data.csv_name }).toString();
@@ -246,6 +265,41 @@ export default function ChatClient() {
       }
       return;
     }
+    if (event === "chart") {
+      try {
+        const raw = payload?.payload ?? payload;
+        const parsed = typeof raw === "string" ? decryptPayload(raw) : raw;
+        const validated = validateChart(parsed);
+        if (validated.ok && validated.chart) {
+          const chart = validated.chart;
+          setCharts((prev) => {
+            const existingIdx = prev.findIndex(
+              (c) => (c.title || c.logical_name || "") === (chart.title || chart.logical_name || "")
+            );
+            let next: ChartPayload[] = existingIdx >= 0 ? [...prev] : [chart, ...prev];
+            if (existingIdx >= 0) next[existingIdx] = chart;
+            setChartIdx(0);
+            return next.slice(0, 5);
+          });
+          appendActivity("data", `Chart ${validated.chart.title || validated.chart.logical_name || "chart"}`);
+        } else if (validated.reason) {
+          appendActivity("error", `Chart rejected: ${validated.reason}`);
+        }
+      } catch (err: any) {
+        appendActivity("error", "Failed to decrypt chart");
+      }
+      return;
+    }
+    if (event === "chart_rejected") {
+      try {
+        const raw = payload?.payload ?? payload;
+        const parsed = typeof raw === "string" ? decryptPayload(raw) : raw;
+        appendActivity("error", `Chart rejected: ${parsed?.reason || "unknown reason"}`);
+      } catch (err: any) {
+        appendActivity("error", "Chart rejected (could not decrypt reason)");
+      }
+      return;
+    }
     if (event === "data_download") {
       try {
         const raw = payload?.payload ?? payload;
@@ -283,6 +337,33 @@ export default function ChatClient() {
         return "Error";
     }
   };
+
+  function validateChart(raw: any): { ok: boolean; chart?: ChartPayload; reason?: string } {
+    if (!raw || typeof raw !== "object") return { ok: false, reason: "empty chart payload" };
+    const chart_type = raw.chart_type;
+    const x_field = raw.x_field;
+    const data = Array.isArray(raw.data) ? raw.data.slice(0, 200) : [];
+    const series = Array.isArray(raw.series)
+      ? raw.series
+          .slice(0, 10)
+          .filter((s: any) => s && s.y_field)
+          .map((s: any) => ({ name: s.name || s.y_field, y_field: s.y_field, color: s.color }))
+      : [];
+    if (!chart_type || !x_field || series.length === 0) return { ok: false, reason: "missing chart fields" };
+    return {
+      ok: true,
+      chart: {
+        chart_type,
+        x_field,
+        series,
+        data,
+        title: raw.title,
+        note: raw.note,
+        df_name: raw.df_name,
+        logical_name: raw.logical_name,
+      },
+    };
+  }
 
   return (
     <div className="mx-auto flex min-h-screen w-full max-w-screen-2xl flex-col gap-6 px-4 py-8">
@@ -340,7 +421,7 @@ export default function ChatClient() {
 
           <div className="flex flex-col gap-3">
             <div className="space-y-3">
-              <div className="grid w-full grid-cols-2 rounded-md border border-slate-200 bg-slate-50">
+              <div className="grid w-full grid-cols-3 rounded-md border border-slate-200 bg-slate-50">
                 <button
                   onClick={() => setActiveTab("summary")}
                   className={cn(
@@ -358,6 +439,15 @@ export default function ChatClient() {
                   )}
                 >
                   Data
+                </button>
+                <button
+                  onClick={() => setActiveTab("charts")}
+                  className={cn(
+                    "py-2 text-sm font-semibold",
+                    activeTab === "charts" ? "bg-white text-slate-900 shadow-inner" : "text-slate-600"
+                  )}
+                >
+                  Charts
                 </button>
               </div>
 
@@ -382,6 +472,47 @@ export default function ChatClient() {
                   <div className="rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-600">No data yet.</div>
                 ) : (
                   <PaginatedTable frame={dataFrames[0]} download={downloads[0]} />
+                )
+              )}
+
+              {activeTab === "charts" && (
+                charts.length === 0 ? (
+                  <div className="rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-600">
+                    No charts yet. Ask for a bar or line chart after loading data.
+                  </div>
+                ) : (
+                  <div className="space-y-3 rounded-xl border border-slate-200 bg-white p-4">
+                    {charts.length > 1 && (
+                      <div className="flex flex-wrap gap-2 text-sm">
+                        {charts.map((c, idx) => (
+                          <button
+                            key={`${c.title || c.logical_name || "chart"}-${idx}`}
+                            onClick={() => setChartIdx(idx)}
+                            className={cn(
+                              "rounded-md border px-2 py-1",
+                              chartIdx === idx ? "border-slate-900 bg-slate-100" : "border-slate-200 bg-white"
+                            )}
+                          >
+                            {c.title || c.logical_name || `Chart ${idx + 1}`}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    <ChartCard chart={charts[chartIdx] || charts[0]} />
+                    <div className="flex items-center justify-between text-xs text-slate-600">
+                      <div>
+                        {charts[chartIdx]?.logical_name || charts[chartIdx]?.df_name || "chart"} ·{" "}
+                        {charts[chartIdx]?.data?.length || 0} rows · x: {charts[chartIdx]?.x_field}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab("data")}
+                        className="text-emerald-700 hover:underline"
+                      >
+                        View as table
+                      </button>
+                    </div>
+                  </div>
                 )
               )}
             </div>

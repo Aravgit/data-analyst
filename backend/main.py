@@ -194,7 +194,7 @@ async def handle_op(op: Op):
                 events.append(Event(session.session_id, "partial", {"text": ev.get("text")}))
             elif etype == "error":
                 events.append(Event(session.session_id, "error", {"message": ev["message"]}))
-            elif etype in ("data_frame", "data_download"):
+            elif etype in ("data_frame", "data_download", "chart", "chart_rejected"):
                 events.append(Event(session.session_id, etype, {"payload": ev.get("payload")}))
     return events
 

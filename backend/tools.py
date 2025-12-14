@@ -143,6 +143,47 @@ def load_csv_columns_schema() -> Dict[str, Any]:
     }
 
 
+def send_chart_to_ui_schema() -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "name": "send_chart_to_ui",
+        "description": "Emit a chart spec for an existing DataFrame to the UI (bar/line/area/pie). Use after computing aggregates.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "df_name": {"type": "string", "description": "Name of DataFrame in the REPL"},
+                "logical_name": {"type": "string", "description": "Label to show in UI"},
+                "chart_type": {
+                    "type": "string",
+                    "enum": ["bar", "line", "area", "pie"],
+                    "description": "Chart type (prefer bar/line; pie only for few categories)",
+                },
+                "x_field": {"type": "string", "description": "Column for x-axis or category"},
+                "series": {
+                    "type": "array",
+                    "description": "List of series (y values) to plot",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "Display name (defaults to y_field)"},
+                            "y_field": {"type": "string", "description": "Numeric column for values"},
+                        },
+                        "required": ["name", "y_field"],
+                        "additionalProperties": False,
+                    },
+                    "minItems": 1,
+                    "maxItems": 10,
+                },
+                "title": {"type": "string", "description": "Optional title"},
+                "note": {"type": "string", "description": "Optional short note/footnote"},
+            },
+            "required": ["df_name", "chart_type", "x_field", "series"],
+            "additionalProperties": False,
+        },
+        "strict": False,
+    }
+
+
 def send_df_to_ui_schema() -> Dict[str, Any]:
     return {
         "type": "function",
@@ -272,6 +313,26 @@ def _load_csv_run(session: SessionState, args: Dict[str, Any]) -> Dict[str, Any]
     return load_csv_into_session(session, args.get("name", ""), args.get("df_name", "df"))
 
 
+def _send_chart_run(session: SessionState, args: Dict[str, Any]) -> Dict[str, Any]:
+    df_name = args.get("df_name", "")
+    df = session.python.globals.get(df_name)
+    if df is None:
+        return {"kind": "error", "traceback": f"DataFrame '{df_name}' not found."}
+    return {
+        "kind": "chart",
+        "df_name": df_name,
+        "logical_name": args.get("logical_name") or df_name,
+        "chart_spec": {
+            "title": args.get("title"),
+            "chart_type": args.get("chart_type"),
+            "x_field": args.get("x_field"),
+            "series": args.get("series") or [],
+            "note": args.get("note"),
+            "df_name": df_name,
+        },
+    }
+
+
 TOOL_REGISTRY: Dict[str, Tool] = {
     "python_repl": Tool("python_repl", python_repl_schema(), _python_repl_run),
     "list_csv_files": Tool("list_csv_files", list_csv_files_schema(), _list_csv_run),
@@ -286,6 +347,11 @@ TOOL_REGISTRY: Dict[str, Tool] = {
         "send_data_to_ui_as_df",
         send_df_to_ui_schema(),
         lambda s, a: send_df_to_ui_as_df(s, a.get("df_name", ""), a.get("logical_name", "df")),
+    ),
+    "send_chart_to_ui": Tool(
+        "send_chart_to_ui",
+        send_chart_to_ui_schema(),
+        _send_chart_run,
     ),
 }
 

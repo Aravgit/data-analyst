@@ -10,7 +10,7 @@ from openai.types.responses import Response
 from session import SessionState
 from pydantic import BaseModel
 from tools import TOOL_REGISTRY, TOOLING_SPEC, safe_tool_output
-from data_events import make_data_frame_event, encrypt_payload
+from data_events import make_data_frame_event, make_chart_event, encrypt_payload
 
 MODEL = "gpt-5.1"
 REASONING_EFFORT = "medium"
@@ -111,32 +111,66 @@ def compact_session(
     return summary
 
 
-def _extract_data_event(result: Any, session: SessionState) -> Optional[Dict[str, Any]]:
+def _extract_data_events(result: Any, session: SessionState) -> List[Dict[str, Any]]:
+    """
+    Extract data-related events (tables, charts) from a tool result.
+    """
+    events: List[Dict[str, Any]] = []
     if not isinstance(result, dict):
-        return None
-    if result.get("kind") != "dataframe":
-        return None
+        return events
 
-    df_name = result.get("df_name", "df")
-    logical = result.get("logical_name") or df_name
-    df = session.python.globals.get(df_name)
-    if df is not None:
-        try:
-            evts, _ = make_data_frame_event(df, df_name, session.session_id, logical, DATA_ROOT)
-            return evts[0] if evts else None
-        except Exception:
-            return None
+    # DataFrame event
+    if result.get("kind") == "dataframe":
+        df_name = result.get("df_name", "df")
+        logical = result.get("logical_name") or df_name
+        df = session.python.globals.get(df_name)
+        if df is not None:
+            try:
+                evts, _ = make_data_frame_event(df, df_name, session.session_id, logical, DATA_ROOT)
+                events.extend(evts)
+            except Exception:
+                pass
+        else:
+            head = result.get("head") or []
+            payload = {
+                "df_name": df_name,
+                "logical_name": logical,
+                "columns": result.get("columns") or [],
+                "rows": head,
+                "row_count": result.get("row_count"),
+                "dtypes": result.get("dtypes") or {},
+            }
+            events.append({"type": "data_frame", "payload": encrypt_payload(payload)})
 
-    head = result.get("head") or []
-    payload = {
-        "df_name": df_name,
-        "logical_name": logical,
-        "columns": result.get("columns") or [],
-        "rows": head,
-        "row_count": result.get("row_count"),
-        "dtypes": result.get("dtypes") or {},
-    }
-    return {"type": "data_frame", "payload": encrypt_payload(payload)}
+    # Chart event if provided
+    chart_spec = result.get("chart") or result.get("chart_spec")
+    if chart_spec:
+        df_for_chart = None
+        df_name = result.get("df_name") or (chart_spec.get("df_name") if isinstance(chart_spec, dict) else None)
+        if df_name:
+            df_for_chart = session.python.globals.get(df_name)
+        if df_for_chart is None and isinstance(result.get("head"), list):
+            try:
+                import pandas as pd
+
+                df_for_chart = pd.DataFrame(result.get("head"))
+            except Exception:
+                df_for_chart = None
+        if df_for_chart is not None:
+            try:
+                chart_events, reject_reason = make_chart_event(df_for_chart, chart_spec, session.session_id, result.get("logical_name"))
+                if chart_events:
+                    events.extend(chart_events)
+                elif reject_reason:
+                    events.append({"type": "chart_rejected", "payload": encrypt_payload({"reason": reject_reason})})
+            except Exception:
+                pass
+
+    # Direct chart-only result that already has payload
+    if result.get("kind") == "chart" and result.get("payload"):
+        events.append({"type": "chart", "payload": result.get("payload")})
+
+    return events
 
 
 def run_agent_turn(
@@ -163,7 +197,7 @@ def run_agent_turn(
     reply_tokens = 0
     turn_input_tokens = 0
     turn_output_tokens = 0
-    last_data_event: Optional[Dict[str, Any]] = None
+    data_events: List[Dict[str, Any]] = []
 
     while turns < max_turns:
         turns += 1
@@ -345,9 +379,9 @@ def run_agent_turn(
                 )
 
                 try:
-                    evt = _extract_data_event(result, session)
-                    if evt:
-                        last_data_event = evt
+                    evts = _extract_data_events(result, session)
+                    if evts:
+                        data_events.extend(evts)
                 except Exception:
                     logger.exception("data event extraction failed", extra={"session_id": session.session_id})
 
@@ -430,7 +464,7 @@ def run_agent_turn(
         "input_tokens": turn_input_tokens,
         "output_tokens": turn_output_tokens,
         "status": status,
-        "data_events": [last_data_event] if last_data_event else [],
+        "data_events": data_events,
     }
 
 
@@ -461,7 +495,7 @@ async def run_agent_turn_async(
     reply_sent = False
     over_limit_after_turn = False
     reply_tokens = 0
-    last_data_event: Optional[Dict[str, Any]] = None
+    data_events: List[Dict[str, Any]] = []
 
     while turns < max_turns:
         turns += 1
@@ -621,9 +655,9 @@ async def run_agent_turn_async(
                 yield {"type": "tool_result", "call_id": call_id, "result_kind": result.get("kind") if isinstance(result, dict) else None}
 
                 try:
-                    evt = _extract_data_event(result, session)
-                    if evt:
-                        last_data_event = evt
+                    evts = _extract_data_events(result, session)
+                    if evts:
+                        data_events.extend(evts)
                 except Exception:
                     logger.exception("data event extraction failed", extra={"session_id": session.session_id})
 
@@ -645,8 +679,8 @@ async def run_agent_turn_async(
         if not reply_text.strip():
             reply_text = "No content returned."
         session.messages.append({"role": "assistant", "content": reply_text})
-        if last_data_event:
-            yield {"type": last_data_event.get("type"), "payload": last_data_event.get("payload")}
+        for evt in data_events:
+            yield {"type": evt.get("type"), "payload": evt.get("payload")}
         yield {"type": "reply", "text": reply_text, "status": "ok", "total_tokens": reply_tokens}
         reply_sent = True
         break
@@ -667,7 +701,7 @@ def system_prompt() -> str:
         "You are Codex, a coding/data agent, developed by Actalyst. Apply these rules:\n"
         "- Answer only questions related to the provided data; ask for refinement if unclear.\n"
         "- Use tools for computation/data access; prefer python_repl for analysis. Discover CSV names with list_csv_files. First inspect with load_csv_sample (nrows default 200). When ready, use load_csv_columns to load all rows of just the needed columns. Use load_csv_handle only if you must load the entire table.\n"
-        "- Tables are delivered to the UI via data_frame/data_download events. Never paste large tables in your final message. Include a Markdown table only when the result has 20 rows or fewer; otherwise summarize with aggregates and say the data is too large to inline, suggesting helpful aggregations/filters.\n"
+        "- Tables are delivered to the UI via data_frame/data_download events. Charts are delivered via chart events triggered by send_chart_to_ui. Never paste large tables in your final message. Include a Markdown table only when the result has 20 rows or fewer; otherwise summarize with aggregates and say the data is too large to inline, suggesting helpful aggregations/filters.\n"
         "- Keep messages concise; highlight findings and aggregates, not code.\n"
         "- When a tool fails, report briefly and propose a fix.\n"
         "- Stop calling tools once you have the answer.\n"
@@ -676,6 +710,7 @@ def system_prompt() -> str:
         "- Derived columns from computations are allowed; never fabricate data.\n"
         "- For each question, assess required columns from current context; do not reuse old columns unless relevant or loaded.\n"
         "- In final summaries use Markdown with headings/bullets; include a small table only when <=20 rows; otherwise omit tables and point to the Data tab or suggest grouping/filtering to reduce size.\n"
-        "   - The summary should essentially capture and answer the user question or clarify requirements etc. Do'nt say The full table is available in the Data tab as 'OCT-25-26 cost by business unit', etc."
-        "- The data tab shows full results via events(but don't say that in summary); the text summary is reserved for small outputs. Before replying, emit the final analysis dataframe via data_frame (use send_data_to_ui_as_df on your final df). If a result exceeds 20 rows, avoid inlining and recommend an aggregation (e.g., by category or time) to shrink it."
+        "   - The summary should essentially capture and answer the user question or clarify requirements etc. Do'nt say The full table is available in the Data tab as 'OCT-25-26 cost by business unit', etc.\n"
+        "- The data tab shows full results via events(but don't say that in summary); the text summary is reserved for small outputs. Before replying, emit the final analysis dataframe via data_frame (use send_data_to_ui_as_df on your final df). If a result exceeds 20 rows, avoid inlining and recommend an aggregation (e.g., by category or time) to shrink it.\n"
+        "- When a chart would help (or when asked), call send_chart_to_ui with chart_type (bar/line/area; pie only if few categories), x_field, and series (y_field plus optional name/color) using the DataFrame already in memory. Keep chart rows <= 200."
     )
