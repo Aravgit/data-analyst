@@ -20,7 +20,7 @@ type Message = { role: Role; content: string };
 type UploadResponse = { session_id: string; csv_name: string; path: string };
 type ChatResponse = { session_id: string; reply: string; total_tokens: number; status: string };
 
-const apiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+const apiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8105";
 
 type DataFrameEvent = {
   df_name: string;
@@ -31,13 +31,6 @@ type DataFrameEvent = {
   dtypes?: Record<string, string>;
 };
 
-type DownloadEvent = {
-  df_name: string;
-  logical_name?: string;
-  rows?: number;
-  columns?: number;
-  path: string;
-};
 
 type ChartSeries = { name: string; y_field: string; color?: string };
 type ChartPayload = {
@@ -76,7 +69,6 @@ export default function ChatClient() {
   const [streamingAssistant, setStreamingAssistant] = useState<{ idx: number; text: string } | null>(null);
   const [csvName, setCsvName] = useState<string>("");
   const [dataFrames, setDataFrames] = useState<DataFrameEvent[]>([]);
-  const [downloads, setDownloads] = useState<DownloadEvent[]>([]);
   const [charts, setCharts] = useState<ChartPayload[]>([]);
   const [chartIdx, setChartIdx] = useState(0);
   const [activeTab, setActiveTab] = useState<"summary" | "data" | "charts">("summary");
@@ -150,13 +142,17 @@ export default function ChatClient() {
   }
 
   async function streamChat(text: string) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 second timeout
     try {
       const payload = { message: text, session_id: sessionId };
       const res = await fetch(`${apiBase}/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        signal: controller.signal
       });
+      clearTimeout(timeoutId);
       if (!res.ok || !res.body) {
         throw new Error(await res.text());
       }
@@ -177,8 +173,12 @@ export default function ChatClient() {
       }
       if (buffer.trim().length) await handleSseEvent(buffer);
     } catch (err: any) {
-      push({ role: "error", content: err?.message || "Agent error." });
-      appendActivity("error", err?.message || "Agent error.");
+      clearTimeout(timeoutId);
+      const errorMsg = err?.name === "AbortError"
+        ? "Request timed out. Please try a simpler query."
+        : (err?.message || "Agent error.");
+      push({ role: "error", content: errorMsg });
+      appendActivity("error", errorMsg);
     } finally {
       setThinking(false);
       setStreamingAssistant(null);
@@ -219,7 +219,7 @@ export default function ChatClient() {
         push({ role: "assistant", content: replyText });
       }
       if (status === "token_limit") {
-        push({ role: "status", content: "Token budget reached (50k). Continuing with compacted history." });
+        push({ role: "status", content: "Token budget reached (100k). Continuing with compacted history." });
       }
       appendActivity("reply", "Reply received");
       return;
@@ -252,7 +252,14 @@ export default function ChatClient() {
     if (event === "data_frame") {
       try {
         const raw = payload?.payload ?? payload;
-        const parsed = typeof raw === "string" ? decryptPayload(raw) : raw;
+        let parsed = typeof raw === "string" ? decryptPayload(raw) : raw;
+        if (typeof parsed === "string") {
+          try {
+            parsed = JSON.parse(parsed);
+          } catch {
+            /* ignore */
+          }
+        }
         if (!parsed || !Array.isArray(parsed.columns) || !Array.isArray(parsed.rows)) {
           appendActivity("error", "Bad data_frame payload");
           return;
@@ -302,18 +309,8 @@ export default function ChatClient() {
       }
       return;
     }
-    if (event === "data_download") {
-      try {
-        const raw = payload?.payload ?? payload;
-        const parsed = typeof raw === "string" ? decryptPayload(raw) : raw;
-        setDownloads((prev) => {
-          const filtered = prev.filter((p) => p.path !== parsed.path);
-          return [parsed as DownloadEvent, ...filtered].slice(0, 10);
-        });
-        appendActivity("data", `Download ready: ${parsed.logical_name || parsed.df_name || "table"}`);
-      } catch (err: any) {
-        appendActivity("error", "Failed to decrypt download info");
-      }
+    if (event === "done") {
+      appendActivity("status", "Agent turn complete");
       return;
     }
   }
@@ -478,7 +475,7 @@ export default function ChatClient() {
                 dataFrames.length === 0 ? (
                   <div className="rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-600">No data yet.</div>
                 ) : (
-                  <PaginatedTable frame={dataFrames[0]} download={downloads[0]} />
+                  <PaginatedTable frame={dataFrames[0]} />
                 )
               )}
 
@@ -573,19 +570,6 @@ export default function ChatClient() {
                   <span>{a.detail}</span>
                 </div>
               ))}
-              {downloads.length > 0 && (
-                <div className="rounded-md border border-slate-200 bg-white px-2 py-2">
-                  <div className="text-[10px] uppercase tracking-wide text-slate-500 mb-1">Downloads</div>
-                  <div className="space-y-1">
-                    {downloads.map((d, idx) => (
-                      <div key={idx} className="text-xs">
-                        <span className="font-semibold">{d.logical_name || d.df_name || "table"}</span>:{" "}
-                        <code className="bg-slate-50 px-1 rounded">{d.path}</code>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
             </div>
           )}
         </Card>

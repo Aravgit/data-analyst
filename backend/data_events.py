@@ -7,10 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-CELL_THRESHOLD = int(os.getenv("DATA_EVENT_CELL_THRESHOLD", "10000"))  # cells = rows * cols
-ROW_THRESHOLD = int(os.getenv("DATA_EVENT_ROW_THRESHOLD", "5000"))
-INLINE_ROW_LIMIT = int(os.getenv("DATA_EVENT_INLINE_ROWS", "200"))
-EXPORT_DIR_NAME = "exports"
+FINAL_DF_ROW_LIMIT = int(os.getenv("DATA_EVENT_FINAL_DF_ROWS", "2000"))
+FINAL_DF_CELL_LIMIT = int(os.getenv("DATA_EVENT_FINAL_DF_CELLS", "200000"))
 
 ALLOWED_CHART_TYPES = {"bar", "column", "stacked_column", "line", "scatter"}
 MAX_CHART_ROWS = 200
@@ -61,7 +59,10 @@ def make_data_frame_event(
     """
     cols = list(df.columns)
     row_count = int(len(df))
-    head_rows = df.head(INLINE_ROW_LIMIT)
+    max_rows = FINAL_DF_ROW_LIMIT if FINAL_DF_ROW_LIMIT > 0 else row_count
+    if FINAL_DF_CELL_LIMIT > 0 and cols:
+        max_rows = min(max_rows, max(1, FINAL_DF_CELL_LIMIT // len(cols)))
+    head_rows = df.head(max_rows)
     dtypes = {c: str(t) for c, t in df.dtypes.items()}
 
     events: List[Dict[str, Any]] = []
@@ -75,24 +76,11 @@ def make_data_frame_event(
         "rows": head_rows.to_dict(orient="records"),
         "row_count": row_count,
         "dtypes": dtypes,
+        "truncated": int(len(head_rows)) < row_count,
     }
     events.append({"type": "data_frame", "payload": encrypt_payload(payload)})
 
-    if base_dir is not None and (row_count > ROW_THRESHOLD or cells > CELL_THRESHOLD):
-        exports_dir = base_dir / session_id / EXPORT_DIR_NAME
-        exports_dir.mkdir(parents=True, exist_ok=True)
-        file_name = f"{logical_name or df_name}.csv"
-        out_path = exports_dir / file_name
-        df.to_csv(out_path, index=False)
-        download_payload = {
-            "df_name": df_name,
-            "logical_name": logical_name,
-            "rows": row_count,
-            "columns": len(cols),
-            "path": str(out_path),
-        }
-        events.append({"type": "data_download", "payload": encrypt_payload(download_payload)})
-        download_path = str(out_path)
+    # No file exports; data is delivered via data_frame events only.
 
     return events, download_path
 

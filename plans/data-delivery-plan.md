@@ -4,7 +4,7 @@ Goal: deliver raw tabular data to the UI (encrypted), while the agent returns on
 
 ### Backend changes
 1) **Structured tool outputs**
-   - Extend tool return shapes (`load_csv_sample`, `load_csv_columns`, `load_csv_handle`, `python_repl`) to include `kind: "dataframe"` with `head`, `row_count`, `columns`, `dtypes`, `df_name`.
+   - Extend tool return shapes (`load_dataset_sample`, `load_dataset_columns`, `load_dataset_full`, `python_repl`) to include `kind: "dataframe"` with `head`, `row_count`, `columns`, `dtypes`, `df_name` (parquet-backed datasets).
    - Preserve current serialized string for the model, but also emit a structured payload to the UI channel.
 
 2) **Encryption helper**

@@ -22,6 +22,6 @@ COPY --from=builder /app/.next ./.next
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/next.config.js ./next.config.js
 
-EXPOSE 3000
+EXPOSE 3001
 
-CMD ["npm", "run", "start"]
+CMD ["npm", "run", "start", "--", "--port=3001"]

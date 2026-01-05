@@ -25,6 +25,7 @@
   ```
 - Provide concise, action-oriented descriptions; include constraints/expected outputs.
 - Add examples in the system prompt if the tool is complex.
+- All uploaded CSVs are converted to parquet; tools read parquet only.
 
 ### Strict tool schemas (OpenAI Responses)
 - When `strict: true`, OpenAI requires the `required` array to list **every** property that appears in `properties`. If you omit any property from `required`, the schema is rejected with `"required is required to be supplied and to be an array including every key in properties"`.

@@ -5,7 +5,7 @@ import { useState } from "react";
 
 type UploadResponse = { session_id: string; csv_name: string; path: string };
 
-const apiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+const apiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8105";
 
 export default function Home() {
   const router = useRouter();
@@ -57,7 +57,7 @@ export default function Home() {
           <div className="grid gap-3 text-sm text-slate-700 sm:grid-cols-2">
             <div className="glass rounded-xl p-4">
               <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Limits</p>
-              <p className="mt-1 font-semibold text-slate-900">400 MB max CSV · 20k token budget</p>
+              <p className="mt-1 font-semibold text-slate-900">400 MB max CSV · 100k token budget</p>
             </div>
             <div className="glass rounded-xl p-4">
               <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Safety</p>

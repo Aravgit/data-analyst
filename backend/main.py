@@ -1,4 +1,20 @@
 import os
+import multiprocessing as mp
+
+# Reduce thread usage in constrained containers to avoid pthread_create failures.
+os.environ.setdefault("ARROW_NUM_THREADS", "1")
+os.environ.setdefault("ARROW_IO_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+os.environ.setdefault("OMP_DYNAMIC", "FALSE")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("MKL_THREADING_LAYER", "SEQUENTIAL")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_MAX_THREADS", "1")
+os.environ.setdefault("PANDAS_USE_NUMEXPR", "0")
+import faulthandler
 import json
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -20,11 +36,18 @@ DATA_ROOT.mkdir(parents=True, exist_ok=True)
 store = SessionStore()
 dispatcher = Dispatcher(handler=None)  # set later
 app = FastAPI(title="CSV Agent")
+faulthandler.enable()
+try:
+    mp.set_start_method("spawn", force=True)
+except Exception:
+    pass
 
+# CORS configuration - allow_credentials=True with allow_origins=["*"] is invalid
+# Use specific origins in production or disable credentials
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,  # Must be False when using allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -39,6 +62,105 @@ def sse_event(event: str, data: str) -> str:
     return f"event: {event}\ndata: {data}\n\n"
 
 
+def _convert_csv_to_parquet(src_path: Path, parquet_path: Path) -> Dict[str, Any]:
+    import pyarrow as pa
+    import pyarrow.csv as pacsv
+    import pyarrow.parquet as pq
+
+    try:
+        pa.set_cpu_count(1)
+        pa.set_io_thread_count(1)
+    except Exception:
+        pass
+
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    compression = os.getenv("PARQUET_COMPRESSION", "zstd")
+    tmp_path = parquet_path.with_suffix(".parquet.tmp")
+
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        row_count = 0
+        schema = None
+        writer = None
+        success = False
+        try:
+            read_opts = pacsv.ReadOptions(use_threads=False)
+            reader = pacsv.open_csv(src_path, read_options=read_opts)
+            for batch in reader:
+                if writer is None:
+                    schema = batch.schema
+                    writer = pq.ParquetWriter(tmp_path, schema, compression=compression)
+                writer.write_table(pa.Table.from_batches([batch]))
+                row_count += batch.num_rows
+            if writer is not None:
+                writer.close()
+                writer = None
+            if schema is not None:
+                success = True
+        except Exception as exc:
+            last_error = exc
+            # Fallback to pandas for formats pyarrow can't parse
+            try:
+                import pandas as pd
+                import pyarrow as pa
+                import pyarrow.parquet as pq
+
+                if writer is not None:
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
+                    writer = None
+                if tmp_path.exists():
+                    tmp_path.unlink(missing_ok=True)
+
+                row_count = 0
+                schema = None
+                chunk_rows = int(os.getenv("CSV_PANDAS_CHUNK_ROWS", "100000"))
+                engine = os.getenv("PANDAS_CSV_ENGINE", "python")
+                # low_memory is not supported with python engine
+                read_kwargs = {"chunksize": chunk_rows, "engine": engine}
+                if engine != "python":
+                    read_kwargs["low_memory"] = False
+                reader = pd.read_csv(src_path, **read_kwargs)
+                for chunk in reader:
+                    if schema is None:
+                        schema = pa.Schema.from_pandas(chunk, preserve_index=False)
+                        writer = pq.ParquetWriter(tmp_path, schema, compression=compression)
+                    try:
+                        table = pa.Table.from_pandas(chunk, schema=schema, preserve_index=False)
+                    except Exception:
+                        table = pa.Table.from_pandas(chunk, preserve_index=False)
+                        if table.schema != schema:
+                            table = table.cast(schema, safe=False)
+                    writer.write_table(table)
+                    row_count += int(len(chunk))
+
+                if writer is not None:
+                    writer.close()
+                    writer = None
+                if schema is not None:
+                    success = True
+                    last_error = None
+            except Exception as pandas_exc:
+                last_error = pandas_exc
+        finally:
+            if writer is not None:
+                writer.close()
+
+        if not success:
+            last_error = last_error or RuntimeError("Parquet conversion failed with empty schema.")
+        else:
+            tmp_path.replace(parquet_path)
+            columns = list(schema.names)
+            dtypes = {name: str(schema.field(name).type) for name in schema.names}
+            return {"row_count": row_count, "columns": columns, "dtypes": dtypes}
+
+    raise RuntimeError(f"Parquet conversion failed after 3 attempts: {last_error}")
+
+
 @app.post("/upload")
 async def upload_csv(file: UploadFile = File(None), path: str = Form(None), session_id: str = Form(None)):
     if not file and not path:
@@ -50,7 +172,7 @@ async def upload_csv(file: UploadFile = File(None), path: str = Form(None), sess
     else:
         # Reset session to ensure a clean chat when replacing data
         store.reset(session_id)
-        session = store.get(session_id)
+        session = store.get_or_create(session_id)
         session_reset = True
 
     max_bytes = 400 * 1024 * 1024  # 400 MB limit
@@ -83,19 +205,55 @@ async def upload_csv(file: UploadFile = File(None), path: str = Form(None), sess
         logical_name = Path(file.filename).stem
     else:
         dest_path = Path(path).expanduser().resolve()
-        if not dest_path.exists():
-            raise HTTPException(status_code=404, detail="Path not found.")
+        # Path traversal validation: ensure path is within DATA_ROOT or is an absolute path
+        # that the user explicitly provided (not trying to access system files)
+        try:
+            # Check if path exists and is a regular file
+            if not dest_path.exists():
+                raise HTTPException(status_code=404, detail="Path not found.")
+            if not dest_path.is_file():
+                raise HTTPException(status_code=400, detail="Path must be a regular file.")
+            # Reject paths that try to access sensitive system directories
+            sensitive_dirs = ["/etc", "/var", "/usr", "/bin", "/sbin", "/root", "/home"]
+            path_str = str(dest_path)
+            for sensitive in sensitive_dirs:
+                if path_str.startswith(sensitive + "/") or path_str == sensitive:
+                    raise HTTPException(status_code=403, detail="Access to this path is not allowed.")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid path: {e}")
         if dest_path.stat().st_size > max_bytes:
             raise HTTPException(status_code=413, detail="CSV too large; max 400 MB.")
         logical_name = dest_path.stem
 
+    parquet_dir = DATA_ROOT / session.session_id
+    parquet_dir.mkdir(parents=True, exist_ok=True)
+    parquet_path = parquet_dir / f"{logical_name}.parquet"
+
+    try:
+        meta = await run_in_threadpool(_convert_csv_to_parquet, dest_path, parquet_path)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to convert CSV to parquet: {exc}")
+
     session.csv_registry.clear()
-    session.csv_registry[logical_name] = str(dest_path)
+    csv_bytes = dest_path.stat().st_size if dest_path.exists() else None
+    parquet_bytes = parquet_path.stat().st_size if parquet_path.exists() else None
+
+    session.csv_registry[logical_name] = {
+        "csv_path": str(dest_path),
+        "parquet_path": str(parquet_path),
+        "row_count": meta.get("row_count"),
+        "columns": meta.get("columns"),
+        "dtypes": meta.get("dtypes"),
+        "csv_bytes": csv_bytes,
+        "parquet_bytes": parquet_bytes,
+    }
     # Hint to the model about newly available data
     session.messages = [
         {
             "role": "assistant",
-            "content": f"CSV '{logical_name}' registered and ready. Use load_csv_handle('{logical_name}', '<df_name>') to load it for analysis.",
+            "content": f"Dataset '{logical_name}' registered and ready. It has been converted to parquet for full-data analysis. Use load_dataset_full('{logical_name}', '<df_name>') if you need the entire table.",
         }
     ]
     session.total_tokens = 0
@@ -104,13 +262,21 @@ async def upload_csv(file: UploadFile = File(None), path: str = Form(None), sess
         "session_id": session.session_id,
         "csv_name": logical_name,
         "path": str(dest_path),
+        "parquet_path": str(parquet_path),
+        "csv_bytes": csv_bytes,
+        "parquet_bytes": parquet_bytes,
         "session_reset": session_reset,
     }
 
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    session = store.get(req.session_id) if req.session_id else store.new()
+    if req.session_id:
+        session = store.get(req.session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found. Please upload a file first.")
+    else:
+        session = store.new()
     result = run_agent_turn(session, req.message)
     return {
         "session_id": session.session_id,
@@ -126,7 +292,12 @@ async def chat_stream(req: ChatRequest):
     """
     SSE stream: send a simple start -> reply -> done sequence (no partial streaming).
     """
-    session = store.get(req.session_id) if req.session_id else store.new()
+    if req.session_id:
+        session = store.get(req.session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found. Please upload a file first.")
+    else:
+        session = store.new()
 
     async def event_generator():
         yield sse_event("status", "start")
@@ -169,14 +340,20 @@ async def reset(session_id: str):
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    return {"ok": True, "sessions": store.stats()}
 
 
 # Dispatcher handler that wraps run_agent_turn synchronously for now
 async def handle_op(op: Op):
     events: List[Event] = []
     if op.kind == "user_message":
-        session = store.get(op.session_id) if op.session_id else store.new()
+        if op.session_id:
+            session = store.get(op.session_id)
+            if session is None:
+                events.append(Event(op.session_id, "error", {"message": "Session not found"}))
+                return events
+        else:
+            session = store.new()
         async for ev in run_agent_turn_async(session, op.payload.get("message", "")):
             etype = ev.get("type")
             if etype == "reply":

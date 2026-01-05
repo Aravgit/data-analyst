@@ -9,13 +9,11 @@ type Frame = {
   dtypes?: Record<string, string>;
 };
 
-type Download = { path: string; logical_name?: string; df_name?: string };
-
-type Props = { frame: Frame; download?: Download };
+type Props = { frame: Frame };
 
 const PAGE_SIZE = 10;
 
-export default function PaginatedTable({ frame, download }: Props) {
+export default function PaginatedTable({ frame }: Props) {
   const rows = Array.isArray(frame.rows) ? frame.rows : [];
   const [page, setPage] = useState(0);
 
@@ -42,11 +40,6 @@ export default function PaginatedTable({ frame, download }: Props) {
             rows
           </p>
         </div>
-        {download && (
-          <div className="text-xs text-slate-700">
-            Download: <code className="text-[11px] bg-white px-1 rounded">{download.path}</code>
-          </div>
-        )}
       </div>
       <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white">
         <table className="min-w-full text-xs text-slate-900">

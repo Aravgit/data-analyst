@@ -34,8 +34,8 @@ Goal: Rebuild the backend agent to match codex-rs’ architecture and the OpenAI
 ## 3) Tools & Execution
 - Tool schemas:
   - python_repl(code: string)
-  - list_csv_files()
-  - load_csv_handle(name: string, df_name: string)
+  - list_datasets()
+  - load_dataset_full(name: string, df_name: string)
   - (future) shell, apply_patch, plan if approved.
 - Execution policy:
   - Python REPL is stateful; serialize REPL calls (no parallel within a session).
@@ -50,7 +50,7 @@ Goal: Rebuild the backend agent to match codex-rs’ architecture and the OpenAI
 - SessionState holds: messages, tool outputs, REPL globals, token totals, config knobs.
 - SessionStore: thread-safe (async lock); support eviction or TTL later.
 - Token accounting: use `usage` attributes; accumulate; enforce TOKEN_LIMIT with early and post-checks.
-- Reset: clear messages, REPL, CSV registry, token count.
+- Reset: clear messages, REPL, dataset registry (parquet), token count.
 
 ## 5) Telemetry & Logging
 - Structured logs with session_id, turn, attempt, tool_name, call_id, tokens.
@@ -75,7 +75,7 @@ Goal: Rebuild the backend agent to match codex-rs’ architecture and the OpenAI
 - Expose: model, temperature/top_p, max_output_tokens, TOKEN_LIMIT, parallel_tool_calls toggle, streaming toggle, log level.
 
 ## 9) HTTP API Adjustments
-- `/upload`: unchanged logic, but emit Event when CSV registered.
+- `/upload`: convert CSV to parquet; emit Event when dataset registered.
 - `/chat`: enqueue Op, block until final Event; return reply, tokens, status.
 - `/chat/stream`: SSE; forward Events.
 - `/health`: keep simple OK.
