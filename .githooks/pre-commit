@@ -1,0 +1,58 @@
+#!/bin/sh
+set -e
+
+branch="$(git rev-parse --abbrev-ref HEAD)"
+
+# Block commits on main
+if [ "$branch" = "main" ]; then
+  echo "Commits on main are blocked. Create a branch and open a PR."
+  exit 1
+fi
+
+# Enforce branch naming
+pattern='^(feature|fix|chore|docs|refactor|test|perf|hotfix)/[a-z0-9._-]+$'
+if ! printf '%s' "$branch" | grep -Eq "$pattern"; then
+  echo "Branch name '$branch' does not match required pattern: $pattern"
+  exit 1
+fi
+
+# Prevent committing large files
+max_bytes=$((50 * 1024 * 1024))
+large_files=""
+for f in $(git diff --cached --name-only --diff-filter=AM); do
+  if [ -f "$f" ]; then
+    size=$(wc -c <"$f" | tr -d ' ')
+    if [ "$size" -gt "$max_bytes" ]; then
+      large_files="$large_files\n$f (${size} bytes)"
+    fi
+  fi
+  # block node_modules in repo
+  case "$f" in
+    */node_modules/*|node_modules/*)
+      echo "Do not commit node_modules: $f"
+      exit 1
+      ;;
+  esac
+
+done
+if [ -n "$large_files" ]; then
+  echo "Large files detected in commit (limit 50MB):"
+  printf '%b\n' "$large_files"
+  exit 1
+fi
+
+# Check for merge conflict markers in staged files
+conflict_files=$(git diff --cached --name-only --diff-filter=AM | xargs -I{} sh -c 'grep -n "<<<<<<<\|=======\|>>>>>>>" -H "{}" 2>/dev/null || true')
+if [ -n "$conflict_files" ]; then
+  echo "Merge conflict markers found:"
+  printf '%s\n' "$conflict_files"
+  exit 1
+fi
+
+# Basic whitespace check
+if ! git diff --cached --check > /dev/null 2>&1; then
+  echo "Whitespace errors detected. Run 'git diff --cached --check' for details."
+  exit 1
+fi
+
+exit 0
