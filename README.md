@@ -46,7 +46,11 @@
 ```bash
 git clone <repository-url>
 cd data-analyst
+git config core.hooksPath .githooks
 ```
+
+Branch naming required (enforced by pre-commit hook):
+`feature|fix|chore|docs|refactor|test|perf|hotfix/<slug>`
 
 2. **Create `.env` file:**
 ```bash
