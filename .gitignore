@@ -181,9 +181,10 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
-frontend/.next
-frontend/node_modules
-frontend/.next
-frontend/node_modules/*
+# Node.js
+node_modules/
+
+# Next.js
+.next/
 
 /openai-codex/
