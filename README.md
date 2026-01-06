@@ -2,6 +2,8 @@
 
 **AI-powered CSV analysis chatbot** with natural language interface. Upload your data, ask questions, get insights with tables and charts.
 
+![Data Analyst Agent UI](images/readme_homepage_image.png)
+
 ## Features
 
 - **Natural Language Queries** - Ask questions about your data in plain English
