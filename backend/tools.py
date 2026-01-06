@@ -598,6 +598,7 @@ def _send_chart_run(session: SessionState, args: Dict[str, Any]) -> Dict[str, An
     if df is None and session.python.handoff_df is not None:
         if df_name == session.python.handoff_df_name or df_name == "analysis_df":
             df = session.python.handoff_df
+            session.python.globals[df_name] = df
     if df is None:
         return {"kind": "error", "traceback": f"DataFrame '{df_name}' not found. Available: {list(session.python.globals.keys())}"}
     return {
