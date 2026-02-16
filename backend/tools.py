@@ -464,6 +464,7 @@ def load_dataset_into_session(session: SessionState, name: str, df_name: str) ->
     try:
         df = _load_dataframe(entry)
         session.python.globals[df_name] = df
+        session.active_dataset = name
         session.python.prune_dataframes(keep_names={df_name})
         return {
             "kind": "dataframe",
@@ -511,6 +512,7 @@ def load_dataset_sample(session: SessionState, name: str, df_name: str = "df_sam
     try:
         df = _load_dataframe(entry, nrows=n)
         session.python.globals[df_name] = df
+        session.active_dataset = name
         session.python.prune_dataframes(keep_names={df_name})
         return {
             "kind": "dataframe",
@@ -537,6 +539,7 @@ def load_dataset_columns(
     try:
         df = _load_dataframe(entry, columns=columns)
         session.python.globals[df_name] = df
+        session.active_dataset = name
         session.python.prune_dataframes(keep_names={df_name})
         return {
             "kind": "dataframe",

@@ -80,6 +80,10 @@ async def test_run_agent_turn_async_message_only(monkeypatch):
     reply_events = [e for e in events if e.get("type") == "reply"]
     assert reply_events, "Expected a reply event"
     assert reply_events[0]["text"] == "hello"
+    token_events = [e for e in events if e.get("type") == "token_usage"]
+    assert token_events, "Expected token_usage event"
+    assert token_events[0]["total_tokens"] == 15
+    assert token_events[0]["lifetime_total_tokens"] == 15
 
 
 os.environ.setdefault("OPENAI_API_KEY", "test")

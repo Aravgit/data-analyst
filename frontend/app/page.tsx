@@ -1,38 +1,74 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { type DragEvent, useState } from "react";
 
-type UploadResponse = { session_id: string; csv_name: string; path: string };
+type UploadResponse = { session_id: string; csv_name: string; path: string; datasets?: string[] };
 
 const apiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8105";
 
 export default function Home() {
   const router = useRouter();
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
   const [path, setPath] = useState("");
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string>("");
+  const [dragActive, setDragActive] = useState(false);
+
+  function collectCsvFiles(fileList: FileList | null): File[] {
+    return Array.from(fileList || []).filter((f) => f.name.toLowerCase().endsWith(".csv"));
+  }
+
+  function handleDrop(e: DragEvent<HTMLLabelElement>) {
+    e.preventDefault();
+    setDragActive(false);
+    const dropped = collectCsvFiles(e.dataTransfer.files);
+    if (dropped.length > 0) setFiles(dropped);
+  }
 
   async function handleUpload() {
     setError("");
-    if (!file && !path.trim()) {
+    if (files.length > 0 && path.trim()) {
+      setError("Choose either CSV file(s) or a server path, not both.");
+      return;
+    }
+    if (files.length === 0 && !path.trim()) {
       setError("Choose a CSV file or enter a path on the server.");
       return;
     }
 
     setUploading(true);
     try {
-      const form = new FormData();
-      if (file) form.append("file", file);
-      if (path.trim()) form.append("path", path.trim());
-
-      const res = await fetch(`${apiBase}/upload`, { method: "POST", body: form });
-      if (!res.ok) throw new Error(await res.text());
-      const data: UploadResponse = await res.json();
-
-      // Pass session + csv via query so chat page can hydrate immediately
-      const search = new URLSearchParams({ session: data.session_id, csv: data.csv_name }).toString();
+      let final: UploadResponse | null = null;
+      if (files.length > 0) {
+        if (files.length > 1) {
+          const form = new FormData();
+          for (const file of files) form.append("files", file);
+          form.append("mode", "append");
+          const res = await fetch(`${apiBase}/upload/batch`, { method: "POST", body: form });
+          if (!res.ok) throw new Error(await res.text());
+          final = await res.json();
+        } else {
+          const form = new FormData();
+          form.append("file", files[0]);
+          form.append("mode", "append");
+          const res = await fetch(`${apiBase}/upload`, { method: "POST", body: form });
+          if (!res.ok) throw new Error(await res.text());
+          final = await res.json();
+        }
+      } else {
+        const form = new FormData();
+        form.append("path", path.trim());
+        form.append("mode", "append");
+        const res = await fetch(`${apiBase}/upload`, { method: "POST", body: form });
+        if (!res.ok) throw new Error(await res.text());
+        final = await res.json();
+      }
+      if (!final) throw new Error("Upload failed.");
+      setFiles([]);
+      setPath("");
+      // Pass session only; chat page hydrates datasets from backend.
+      const search = new URLSearchParams({ session: final.session_id }).toString();
       router.push(`/chat?${search}`);
     } catch (err: any) {
       setError(err?.message || "Upload failed.");
@@ -47,7 +83,7 @@ export default function Home() {
         <div className="space-y-6">
           <p className="text-sm uppercase tracking-[0.25em] text-indigo-600">Data Concierge</p>
           <h1 className="text-4xl font-semibold leading-tight text-slate-900 lg:text-5xl">
-            Upload a CSV, then chat with an agent that thinks in Python.
+            Upload one or more CSVs, then chat with an agent that thinks in Python.
           </h1>
           <p className="text-lg text-slate-700">
             We load your file into a private Python sandbox, so you can ask real questions and get
@@ -79,22 +115,35 @@ export default function Home() {
               <span className="rounded-full bg-indigo-50 px-3 py-1 text-xs text-indigo-700">Instant</span>
             </div>
 
-            <label className="block cursor-pointer rounded-xl border border-dashed border-slate-300 bg-slate-50 p-4 text-sm text-slate-800 transition hover:border-indigo-300 hover:bg-indigo-50/60">
+            <label
+              onDragOver={(e) => {
+                e.preventDefault();
+                if (!dragActive) setDragActive(true);
+              }}
+              onDragLeave={() => setDragActive(false)}
+              onDrop={handleDrop}
+              className={`block cursor-pointer rounded-xl border border-dashed p-4 text-sm text-slate-800 transition ${
+                dragActive
+                  ? "border-indigo-400 bg-indigo-50/70"
+                  : "border-slate-300 bg-slate-50 hover:border-indigo-300 hover:bg-indigo-50/60"
+              }`}
+            >
               <input
                 type="file"
                 accept=".csv"
+                multiple
                 className="hidden"
-                onChange={(e) => setFile(e.target.files?.[0] || null)}
+                onChange={(e) => setFiles(collectCsvFiles(e.target.files))}
               />
-              {file ? (
+              {files.length > 0 ? (
                 <div className="flex items-center justify-between">
                   <div>
-                    <p className="text-slate-900">{file.name}</p>
-                    <p className="text-xs text-slate-500">Ready to upload</p>
+                    <p className="text-slate-900">{files.length} file(s) selected</p>
+                    <p className="text-xs text-slate-500">{files.slice(0, 4).map((f) => f.name).join(", ")}</p>
                   </div>
                   <button
                     type="button"
-                    onClick={() => setFile(null)}
+                    onClick={() => setFiles([])}
                     className="text-xs text-indigo-600 hover:text-indigo-800"
                   >
                     Clear
@@ -106,8 +155,8 @@ export default function Home() {
                     📄
                   </span>
                   <div>
-                    <p className="font-medium">Choose a CSV file</p>
-                    <p className="text-xs text-slate-500">Drag & drop or click to browse</p>
+                    <p className="font-medium">Choose CSV file(s)</p>
+                    <p className="text-xs text-slate-500">Drag multiple files here or click to browse</p>
                   </div>
                 </div>
               )}
@@ -123,6 +172,9 @@ export default function Home() {
             />
 
             {error && <p className="text-sm text-rose-500">{error}</p>}
+            <p className="text-xs text-slate-600">
+              Multi-CSV: select multiple files to append into one session.
+            </p>
 
             <button
               onClick={handleUpload}

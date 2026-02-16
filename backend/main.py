@@ -32,6 +32,7 @@ import shutil
 
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", "./data")).resolve()
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
+SESSION_DATA_BYTES_LIMIT = int(os.environ.get("SESSION_DATA_BYTES_LIMIT", "2147483648"))  # 2GB
 
 store = SessionStore()
 dispatcher = Dispatcher(handler=None)  # set later
@@ -60,6 +61,34 @@ class ChatRequest(BaseModel):
 
 def sse_event(event: str, data: str) -> str:
     return f"event: {event}\ndata: {data}\n\n"
+
+
+def _normalize_dataset_name(raw_name: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in (raw_name or "").strip())
+    cleaned = cleaned.strip("_")
+    return cleaned or "dataset"
+
+
+def _resolve_dataset_name(session, desired_name: str, mode: str) -> str:
+    if mode != "append" or desired_name not in session.csv_registry:
+        return desired_name
+    i = 2
+    while f"{desired_name}_{i}" in session.csv_registry:
+        i += 1
+    return f"{desired_name}_{i}"
+
+
+def _dir_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    total = 0
+    for p in path.rglob("*"):
+        if p.is_file():
+            try:
+                total += p.stat().st_size
+            except Exception:
+                pass
+    return total
 
 
 def _convert_csv_to_parquet(src_path: Path, parquet_path: Path) -> Dict[str, Any]:
@@ -162,25 +191,48 @@ def _convert_csv_to_parquet(src_path: Path, parquet_path: Path) -> Dict[str, Any
 
 
 @app.post("/upload")
-async def upload_csv(file: UploadFile = File(None), path: str = Form(None), session_id: str = Form(None)):
+async def upload_csv(
+    file: UploadFile = File(None),
+    path: str = Form(None),
+    session_id: str = Form(None),
+    mode: str = Form("append"),
+    dataset_name: str = Form(None),
+):
     if not file and not path:
         raise HTTPException(status_code=400, detail="Provide a file or a path.")
+    mode = (mode or "append").strip().lower()
+    if mode not in ("append", "replace_session"):
+        raise HTTPException(status_code=400, detail="Invalid mode. Use 'append' or 'replace_session'.")
 
     session_reset = False
     if not session_id:
         session = store.new()
     else:
-        # Reset session to ensure a clean chat when replacing data
-        store.reset(session_id)
-        session = store.get_or_create(session_id)
-        session_reset = True
+        if mode == "replace_session":
+            store.reset(session_id)
+            session = store.get_or_create(session_id)
+            session_reset = True
+            session_dir = DATA_ROOT / session_id
+            if session_dir.exists():
+                shutil.rmtree(session_dir, ignore_errors=True)
+        else:
+            session = store.get_or_create(session_id)
 
     max_bytes = 400 * 1024 * 1024  # 400 MB limit
+    session_dir = DATA_ROOT / session.session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    created_paths: List[Path] = []
 
     if file:
-        dest_dir = DATA_ROOT / session.session_id
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest_path = dest_dir / file.filename
+        source_name = Path(file.filename).stem if file.filename else "dataset"
+    else:
+        source_name = Path(path).stem
+    preferred_name = _normalize_dataset_name(dataset_name.strip() if dataset_name else source_name)
+    logical_name = _resolve_dataset_name(session, preferred_name, mode)
+
+    if file:
+        dest_path = session_dir / f"{logical_name}.csv"
+        created_paths.append(dest_path)
 
         def _save():
             bytes_written = 0
@@ -201,8 +253,6 @@ async def upload_csv(file: UploadFile = File(None), path: str = Form(None), sess
             if dest_path.exists():
                 dest_path.unlink(missing_ok=True)
             raise
-
-        logical_name = Path(file.filename).stem
     else:
         dest_path = Path(path).expanduser().resolve()
         # Path traversal validation: ensure path is within DATA_ROOT or is an absolute path
@@ -225,20 +275,36 @@ async def upload_csv(file: UploadFile = File(None), path: str = Form(None), sess
             raise HTTPException(status_code=400, detail=f"Invalid path: {e}")
         if dest_path.stat().st_size > max_bytes:
             raise HTTPException(status_code=413, detail="CSV too large; max 400 MB.")
-        logical_name = dest_path.stem
 
-    parquet_dir = DATA_ROOT / session.session_id
-    parquet_dir.mkdir(parents=True, exist_ok=True)
-    parquet_path = parquet_dir / f"{logical_name}.parquet"
+    parquet_path = session_dir / f"{logical_name}.parquet"
+    created_paths.append(parquet_path)
 
     try:
         meta = await run_in_threadpool(_convert_csv_to_parquet, dest_path, parquet_path)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to convert CSV to parquet: {exc}")
 
-    session.csv_registry.clear()
     csv_bytes = dest_path.stat().st_size if dest_path.exists() else None
     parquet_bytes = parquet_path.stat().st_size if parquet_path.exists() else None
+
+    managed_bytes = _dir_size_bytes(session_dir)
+    if SESSION_DATA_BYTES_LIMIT > 0 and managed_bytes > SESSION_DATA_BYTES_LIMIT:
+        for p in created_paths:
+            try:
+                if p.exists() and p.is_file():
+                    p.unlink(missing_ok=True)
+            except Exception:
+                pass
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "code": "session_limit_exceeded",
+                "message": "Session storage limit exceeded.",
+                "limit_bytes": SESSION_DATA_BYTES_LIMIT,
+                "current_bytes": managed_bytes,
+                "session_id": session.session_id,
+            },
+        )
 
     session.csv_registry[logical_name] = {
         "csv_path": str(dest_path),
@@ -249,15 +315,20 @@ async def upload_csv(file: UploadFile = File(None), path: str = Form(None), sess
         "csv_bytes": csv_bytes,
         "parquet_bytes": parquet_bytes,
     }
-    # Hint to the model about newly available data
-    session.messages = [
-        {
-            "role": "assistant",
-            "content": f"Dataset '{logical_name}' registered and ready. It has been converted to parquet for full-data analysis. Use load_dataset_full('{logical_name}', '<df_name>') if you need the entire table.",
-        }
-    ]
-    session.total_tokens = 0
-    session.summary = ""
+    session.dataset_profiles[logical_name] = {
+        "name": logical_name,
+        "row_count": meta.get("row_count"),
+        "columns": meta.get("columns") or [],
+        "dtypes": meta.get("dtypes") or {},
+    }
+    session.active_dataset = logical_name
+
+    if mode == "replace_session":
+        session.messages = []
+        session.total_tokens = 0
+        session.summary = ""
+
+    dataset_names = sorted(session.csv_registry.keys())
     return {
         "session_id": session.session_id,
         "csv_name": logical_name,
@@ -266,6 +337,56 @@ async def upload_csv(file: UploadFile = File(None), path: str = Form(None), sess
         "csv_bytes": csv_bytes,
         "parquet_bytes": parquet_bytes,
         "session_reset": session_reset,
+        "mode": mode,
+        "datasets": dataset_names,
+        "active_dataset": session.active_dataset,
+    }
+
+
+@app.post("/upload/batch")
+async def upload_csv_batch(
+    files: List[UploadFile] = File(None),
+    session_id: str = Form(None),
+    mode: str = Form("append"),
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="Provide at least one file.")
+    if len(files) == 1:
+        return await upload_csv(file=files[0], path=None, session_id=session_id, mode=mode, dataset_name=None)
+
+    uploaded: List[Dict[str, Any]] = []
+    current_session_id = session_id
+    current_mode = mode
+    final_result: Dict[str, Any] | None = None
+    for idx, up_file in enumerate(files):
+        result = await upload_csv(
+            file=up_file,
+            path=None,
+            session_id=current_session_id,
+            mode=current_mode,
+            dataset_name=None,
+        )
+        uploaded.append(
+            {
+                "csv_name": result.get("csv_name"),
+                "path": result.get("path"),
+                "parquet_path": result.get("parquet_path"),
+                "csv_bytes": result.get("csv_bytes"),
+                "parquet_bytes": result.get("parquet_bytes"),
+            }
+        )
+        final_result = result
+        current_session_id = result.get("session_id")
+        # First call can be replace_session if requested; subsequent calls should append.
+        current_mode = "append"
+
+    if final_result is None:
+        raise HTTPException(status_code=500, detail="Batch upload failed.")
+
+    return {
+        **final_result,
+        "uploaded_count": len(uploaded),
+        "uploaded": uploaded,
     }
 
 
@@ -282,8 +403,22 @@ async def chat(req: ChatRequest):
         "session_id": session.session_id,
         "reply": result["reply"],
         "total_tokens": result["total_tokens"],
+        "lifetime_total_tokens": result.get("lifetime_total_tokens"),
         "status": result["status"],
         "data_events": result.get("data_events", []),
+    }
+
+
+@app.get("/session/{session_id}/datasets")
+async def list_session_datasets(session_id: str):
+    session = store.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    names = sorted(session.csv_registry.keys())
+    return {
+        "session_id": session.session_id,
+        "datasets": names,
+        "active_dataset": session.active_dataset,
     }
 
 
@@ -312,10 +447,21 @@ async def chat_stream(req: ChatRequest):
                     "input_tokens": result.get("input_tokens"),
                     "output_tokens": result.get("output_tokens"),
                     "total_tokens": result.get("total_tokens"),
+                    "lifetime_total_tokens": result.get("lifetime_total_tokens"),
                 }
             ),
         )
-        yield sse_event("reply", json.dumps({"text": result["reply"], "status": result["status"], "total_tokens": result["total_tokens"]}))
+        yield sse_event(
+            "reply",
+            json.dumps(
+                {
+                    "text": result["reply"],
+                    "status": result["status"],
+                    "total_tokens": result["total_tokens"],
+                    "lifetime_total_tokens": result.get("lifetime_total_tokens"),
+                }
+            ),
+        )
         yield sse_event("done", json.dumps({"status": result.get("status", "ok")}))
 
     return StreamingResponse(
@@ -357,7 +503,18 @@ async def handle_op(op: Op):
         async for ev in run_agent_turn_async(session, op.payload.get("message", "")):
             etype = ev.get("type")
             if etype == "reply":
-                events.append(Event(session.session_id, "reply", {"text": ev["text"], "status": ev["status"]}))
+                events.append(
+                    Event(
+                        session.session_id,
+                        "reply",
+                        {
+                            "text": ev["text"],
+                            "status": ev["status"],
+                            "total_tokens": ev.get("total_tokens"),
+                            "lifetime_total_tokens": ev.get("lifetime_total_tokens"),
+                        },
+                    )
+                )
                 events.append(Event(session.session_id, "done", {"status": ev["status"], "total_tokens": ev["total_tokens"]}))
             elif etype == "status":
                 events.append(Event(session.session_id, "status", {"stage": ev.get("stage")}))
@@ -366,7 +523,18 @@ async def handle_op(op: Op):
             elif etype == "tool_result":
                 events.append(Event(session.session_id, "tool_result", {"call_id": ev.get("call_id"), "result_kind": ev.get("result_kind")}))
             elif etype == "token_usage":
-                events.append(Event(session.session_id, "token_usage", {"input_tokens": ev.get("input_tokens"), "output_tokens": ev.get("output_tokens"), "total_tokens": ev.get("total_tokens")}))
+                events.append(
+                    Event(
+                        session.session_id,
+                        "token_usage",
+                        {
+                            "input_tokens": ev.get("input_tokens"),
+                            "output_tokens": ev.get("output_tokens"),
+                            "total_tokens": ev.get("total_tokens"),
+                            "lifetime_total_tokens": ev.get("lifetime_total_tokens"),
+                        },
+                    )
+                )
             elif etype == "partial":
                 events.append(Event(session.session_id, "partial", {"text": ev.get("text")}))
             elif etype == "error":

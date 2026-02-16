@@ -17,8 +17,17 @@ const ChartCard = dynamic(() => import("../../components/ui/chart-card"), { ssr:
 type Role = "user" | "assistant" | "status" | "error";
 type Message = { role: Role; content: string };
 
-type UploadResponse = { session_id: string; csv_name: string; path: string };
-type ChatResponse = { session_id: string; reply: string; total_tokens: number; status: string };
+type UploadResponse = {
+  session_id: string;
+  csv_name: string;
+  path: string;
+  mode?: "append" | "replace_session";
+  session_reset?: boolean;
+  datasets?: string[];
+  active_dataset?: string;
+  uploaded_count?: number;
+};
+type DatasetListResponse = { session_id: string; datasets: string[]; active_dataset?: string };
 
 const apiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8105";
 
@@ -61,13 +70,15 @@ export default function ChatClient() {
     output: 0,
     total: 0
   });
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
   const [path, setPath] = useState("");
   const [input, setInput] = useState("");
   const [thinking, setThinking] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [streamingAssistant, setStreamingAssistant] = useState<{ idx: number; text: string } | null>(null);
-  const [csvName, setCsvName] = useState<string>("");
+  const [datasetNames, setDatasetNames] = useState<string[]>([]);
+  const [activeDataset, setActiveDataset] = useState<string>("");
+  const [uploadMode, setUploadMode] = useState<"append" | "replace_session">("append");
   const [dataFrames, setDataFrames] = useState<DataFrameEvent[]>([]);
   const [charts, setCharts] = useState<ChartPayload[]>([]);
   const [chartIdx, setChartIdx] = useState(0);
@@ -75,13 +86,15 @@ export default function ChatClient() {
 
   useEffect(() => {
     const qsSession = search.get("session");
-    const csv = search.get("csv");
-    if (qsSession && !sessionId) {
+    if (qsSession && qsSession !== sessionId) {
       setSessionId(qsSession);
-      setCsvName(csv || "");
-      setMessages([{ role: "assistant", content: `Ready. CSV loaded as '${csv || "your file"}'.` }]);
     }
   }, [search, sessionId]);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    hydrateDatasets(sessionId);
+  }, [sessionId]);
 
   const canChat = useMemo(() => Boolean(sessionId), [sessionId]);
 
@@ -89,36 +102,100 @@ export default function ChatClient() {
   const appendActivity = (kind: string, detail: string) =>
     setActivity((prev) => [{ kind, detail }, ...prev].slice(0, 50));
 
+  async function parseError(res: Response): Promise<string> {
+    try {
+      const payload = await res.json();
+      const detail = payload?.detail;
+      if (typeof detail === "string") return detail;
+      if (detail?.message) return detail.message;
+      return JSON.stringify(detail || payload);
+    } catch {
+      return await res.text();
+    }
+  }
+
+  async function hydrateDatasets(sid: string) {
+    try {
+      const res = await fetch(`${apiBase}/session/${encodeURIComponent(sid)}/datasets`);
+      if (!res.ok) throw new Error(await parseError(res));
+      const data: DatasetListResponse = await res.json();
+      const names = Array.isArray(data.datasets) ? data.datasets : [];
+      setDatasetNames(names);
+      setActiveDataset(data.active_dataset || names[0] || "");
+      if (messages.length === 1 && messages[0].content.includes("Upload a CSV") && names.length > 0) {
+        setMessages([{ role: "assistant", content: `Ready. ${names.length} dataset(s) loaded in this session.` }]);
+      }
+    } catch (err: any) {
+      appendActivity("error", err?.message || "Failed to load dataset list.");
+    }
+  }
+
   async function handleUpload() {
-    if (!file && !path.trim()) {
+    if (files.length > 0 && path.trim()) {
+      push({ role: "error", content: "Choose either CSV file(s) or a server path, not both." });
+      return;
+    }
+    if (files.length === 0 && !path.trim()) {
       push({ role: "error", content: "Choose a CSV file or enter a path." });
       return;
     }
     setUploading(true);
     try {
-      const form = new FormData();
-      if (file) form.append("file", file);
-      if (path.trim()) form.append("path", path.trim());
-      if (sessionId) form.append("session_id", sessionId);
+      let finalUpload: UploadResponse | null = null;
+      if (files.length > 1) {
+        const form = new FormData();
+        for (const f of files) form.append("files", f);
+        if (sessionId) form.append("session_id", sessionId);
+        form.append("mode", uploadMode);
+        const res = await fetch(`${apiBase}/upload/batch`, { method: "POST", body: form });
+        if (!res.ok) throw new Error(await parseError(res));
+        finalUpload = await res.json();
+      } else if (files.length === 1) {
+        const form = new FormData();
+        form.append("file", files[0]);
+        if (sessionId) form.append("session_id", sessionId);
+        form.append("mode", uploadMode);
+        const res = await fetch(`${apiBase}/upload`, { method: "POST", body: form });
+        if (!res.ok) throw new Error(await parseError(res));
+        finalUpload = await res.json();
+      } else {
+        const form = new FormData();
+        form.append("path", path.trim());
+        if (sessionId) form.append("session_id", sessionId);
+        form.append("mode", uploadMode);
+        const res = await fetch(`${apiBase}/upload`, { method: "POST", body: form });
+        if (!res.ok) throw new Error(await parseError(res));
+        finalUpload = await res.json();
+      }
 
-      const res = await fetch(`${apiBase}/upload`, { method: "POST", body: form });
-      if (!res.ok) throw new Error(await res.text());
-      const data: UploadResponse = await res.json();
-      setSessionId(data.session_id);
-      setCsvName(data.csv_name);
-      push({ role: "status", content: `Ready. CSV loaded as '${data.csv_name}'.` });
-      appendActivity("upload", `Loaded ${data.csv_name}`);
+      if (!finalUpload) throw new Error("Upload failed.");
+      const nextSessionId = finalUpload.session_id;
+      setSessionId(nextSessionId);
+      const names = Array.isArray(finalUpload.datasets) ? finalUpload.datasets : [];
+      setDatasetNames(names);
+      setActiveDataset(finalUpload.active_dataset || finalUpload.csv_name || names[0] || "");
+      const uploadedCount = Number(finalUpload.uploaded_count || (files.length > 0 ? files.length : 1));
+      const statusText =
+        uploadedCount > 1
+          ? `Ready. Loaded ${uploadedCount} CSV files into this session.`
+          : `Ready. CSV loaded as '${finalUpload.csv_name}'.`;
+      push({ role: "status", content: statusText });
+      appendActivity("upload", statusText);
 
-      if ((data as any).session_reset) {
+      if (finalUpload.session_reset) {
         setMessages([{ role: "assistant", content: "Upload a CSV to begin, then ask me anything about it." }]);
         setActivity([]);
         setInput("");
+        setDataFrames([]);
         setCharts([]);
         setChartIdx(0);
       }
 
-      const searchParams = new URLSearchParams({ session: data.session_id, csv: data.csv_name }).toString();
+      setFiles([]);
+      setPath("");
+      const searchParams = new URLSearchParams({ session: nextSessionId }).toString();
       router.replace(`/chat?${searchParams}`);
+      await hydrateDatasets(nextSessionId);
     } catch (err: any) {
       push({ role: "error", content: err?.message || "Upload failed." });
     } finally {
@@ -239,9 +316,15 @@ export default function ChatClient() {
     if (event === "token_usage") {
       const inTok = Number(payload.input_tokens || 0);
       const outTok = Number(payload.output_tokens || 0);
-      const totTok = Number(payload.total_tokens || 0);
-      setTokens({ input: inTok, output: outTok, total: totTok });
-      appendActivity("tokens", `In ${inTok}, out ${outTok}, total ${totTok}`);
+      const windowTok = Number(payload.total_tokens || 0);
+      const lifeTok = Number(payload.lifetime_total_tokens ?? windowTok);
+      setTokens({ input: inTok, output: outTok, total: lifeTok });
+      appendActivity(
+        "tokens",
+        lifeTok !== windowTok
+          ? `In ${inTok}, out ${outTok}, session total ${lifeTok} (window ${windowTok})`
+          : `In ${inTok}, out ${outTok}, session total ${lifeTok}`
+      );
       return;
     }
     if (event === "error") {
@@ -376,30 +459,67 @@ export default function ChatClient() {
         <Card className="p-4">
           <div className="mb-3">
             <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Data</p>
-            <h2 className="text-lg font-semibold text-slate-900">Current file</h2>
-            <p className="text-sm text-slate-600">{csvName || "None loaded"}</p>
+            <h2 className="text-lg font-semibold text-slate-900">Datasets</h2>
+            <p className="text-sm text-slate-600">{datasetNames.length ? `${datasetNames.length} loaded` : "None loaded"}</p>
+            <p className="text-xs text-slate-500">Active: {activeDataset || "none"}</p>
           </div>
           <div className="space-y-3">
             <input
               type="file"
               accept=".csv"
-              onChange={(e) => setFile(e.target.files?.[0] || null)}
+              multiple
+              onChange={(e) => setFiles(Array.from(e.target.files || []))}
               className="block w-full text-sm text-slate-700 file:mr-4 file:rounded-md file:border file:border-slate-300 file:bg-white file:px-3 file:py-2 file:text-slate-800 hover:file:bg-slate-50"
             />
+            {files.length > 0 && (
+              <div className="rounded-md border border-slate-200 bg-slate-50 p-2 text-xs text-slate-700">
+                <p className="font-semibold text-slate-900">{files.length} file(s) selected</p>
+                <p className="mt-1 break-words">{files.slice(0, 6).map((f) => f.name).join(", ")}</p>
+              </div>
+            )}
             <Input
               value={path}
               onChange={(e) => setPath(e.target.value)}
               placeholder="Path on server (e.g. /data/sales.csv)"
               className="bg-white text-slate-900 border-slate-300"
             />
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              <button
+                type="button"
+                onClick={() => setUploadMode("append")}
+                className={cn(
+                  "rounded border px-2 py-1",
+                  uploadMode === "append" ? "border-slate-900 bg-slate-100" : "border-slate-300 bg-white"
+                )}
+              >
+                Append
+              </button>
+              <button
+                type="button"
+                onClick={() => setUploadMode("replace_session")}
+                className={cn(
+                  "rounded border px-2 py-1",
+                  uploadMode === "replace_session" ? "border-slate-900 bg-slate-100" : "border-slate-300 bg-white"
+                )}
+              >
+                Replace all
+              </button>
+            </div>
             <Button onClick={handleUpload} disabled={uploading} className="w-full">
-              {uploading ? "Uploading..." : sessionId ? "Replace data" : "Load data"}
+              {uploading ? "Uploading..." : uploadMode === "append" ? "Add dataset(s)" : "Replace session data"}
             </Button>
+            {datasetNames.length > 0 && (
+              <div className="rounded-md border border-slate-200 bg-slate-50 p-2 text-xs text-slate-700">
+                <p className="font-semibold text-slate-900">Available datasets</p>
+                <p className="mt-1 break-words">{datasetNames.join(", ")}</p>
+              </div>
+            )}
             <div className="rounded-lg border border-slate-200 bg-white p-3 text-xs text-slate-600">
               <p className="font-semibold text-slate-900">Tips</p>
               <ul className="mt-1 space-y-1">
                 <li>- Max CSV size 400 MB.</li>
                 <li>- Session stays via URL params.</li>
+                <li>- Append adds file(s) to session, Replace all resets session data.</li>
                 <li>- Ask for samples, summaries, plots.</li>
               </ul>
             </div>
@@ -557,7 +677,7 @@ export default function ChatClient() {
               <p className="font-semibold text-slate-900">{tokens.output}</p>
             </div>
             <div className="rounded-md border border-slate-200 bg-white p-2">
-              <p className="text-[10px] uppercase tracking-wide text-slate-500">Total</p>
+              <p className="text-[10px] uppercase tracking-wide text-slate-500">Session Total</p>
               <p className="font-semibold text-slate-900">{tokens.total}</p>
             </div>
           </div>

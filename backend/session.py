@@ -296,8 +296,11 @@ class SessionState:
     messages: List[Dict[str, Any]] = field(default_factory=list)
     python: PythonSession = field(default_factory=PythonSession)
     total_tokens: int = 0
+    total_tokens_lifetime: int = 0
     pending_compaction: bool = False
     csv_registry: Dict[str, Any] = field(default_factory=dict)
+    dataset_profiles: Dict[str, Any] = field(default_factory=dict)
+    active_dataset: str = ""
     summary: str = ""
 
 

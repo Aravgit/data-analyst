@@ -20,6 +20,9 @@ REASONING_EFFORT = "medium"
 TOKEN_LIMIT = 100000  # combined input + output (hard budget)
 TOKEN_WATERMARK = int(TOKEN_LIMIT * 0.8)  # 80k - trigger compaction before hitting limit
 MAX_API_RETRIES = 3
+CATALOG_MAX_DATASETS = int(os.getenv("DATASET_CATALOG_MAX_DATASETS", "20"))
+CATALOG_MAX_COLUMNS = int(os.getenv("DATASET_CATALOG_MAX_COLUMNS", "30"))
+CATALOG_MAX_CHARS = int(os.getenv("DATASET_CATALOG_MAX_CHARS", "5000"))
 # Streaming of partial chunks is temporarily disabled; we emit only final replies.
 USE_STREAMING = bool(int(os.getenv("ENABLE_RESPONSES_STREAMING", "0")))
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", "./data")).resolve()
@@ -245,6 +248,39 @@ def _safe_output_items(obj: Any) -> List[Any]:
     return output or []
 
 
+def _dataset_catalog_context(session: SessionState) -> str:
+    if not session.csv_registry:
+        return "DATASET INVENTORY (session scope): none"
+
+    names = list(session.csv_registry.keys())
+    active = session.active_dataset
+    ordered = ([active] if active and active in names else []) + [n for n in sorted(names) if n != active]
+    lines: List[str] = []
+    omitted = 0
+
+    for idx, name in enumerate(ordered):
+        if idx >= CATALOG_MAX_DATASETS:
+            omitted += 1
+            continue
+        profile = session.dataset_profiles.get(name) or session.csv_registry.get(name) or {}
+        cols = profile.get("columns") or []
+        row_count = profile.get("row_count")
+        cols_preview = ", ".join(cols[:CATALOG_MAX_COLUMNS])
+        if len(cols) > CATALOG_MAX_COLUMNS:
+            cols_preview += ", ..."
+        active_suffix = " (active)" if name == active else ""
+        row_text = str(row_count) if row_count is not None else "unknown"
+        lines.append(f"- {name}{active_suffix}: rows={row_text}; cols=[{cols_preview}]")
+
+    if omitted > 0:
+        lines.append(f"- ... {omitted} more dataset(s) omitted for token safety")
+
+    context = "DATASET INVENTORY (session scope):\n" + "\n".join(lines)
+    if len(context) > CATALOG_MAX_CHARS:
+        context = context[: max(0, CATALOG_MAX_CHARS - 3)] + "..."
+    return context
+
+
 def run_agent_turn(
     session: SessionState, user_message: str, max_turns: int = 12
 ) -> Dict[str, Any]:
@@ -298,7 +334,7 @@ def run_agent_turn(
                     response = client.responses.create(
                         model=MODEL,
                         reasoning={"effort": REASONING_EFFORT},
-                        input=[{"role": "system", "content": system_prompt()}, *filtered_inputs],
+                        input=[{"role": "system", "content": system_prompt(session)}, *filtered_inputs],
                         tools=TOOLING_SPEC,
                         max_output_tokens=2000,
                     )
@@ -317,6 +353,7 @@ def run_agent_turn(
                         return {
                             "reply": reply_text,
                             "total_tokens": session.total_tokens,
+                            "lifetime_total_tokens": session.total_tokens_lifetime,
                             "status": "error",
                             "data_events": [],
                         }
@@ -331,6 +368,7 @@ def run_agent_turn(
             turn_input_tokens += input_tokens
             turn_output_tokens += output_tokens
             session.total_tokens += input_tokens + output_tokens
+            session.total_tokens_lifetime += input_tokens + output_tokens
             logger.info(
                 "model response received",
                 extra={
@@ -519,7 +557,7 @@ def run_agent_turn(
                 force_response = client.responses.create(
                     model=MODEL,
                     reasoning={"effort": REASONING_EFFORT},
-                    input=[{"role": "system", "content": system_prompt() + "\nProvide the final answer now based on prior tool results. Do not call tools."}, *filtered_inputs],
+                    input=[{"role": "system", "content": system_prompt(session) + "\nProvide the final answer now based on prior tool results. Do not call tools."}, *filtered_inputs],
                     tools=[],  # disable tool calls for the final attempt
                     max_output_tokens=800,
                 )
@@ -564,6 +602,7 @@ def run_agent_turn(
         return {
             "reply": reply_text,
             "total_tokens": reply_tokens,
+            "lifetime_total_tokens": session.total_tokens_lifetime,
             "input_tokens": turn_input_tokens,
             "output_tokens": turn_output_tokens,
             "status": status,
@@ -630,7 +669,7 @@ async def run_agent_turn_async(
                     stream = await async_client.responses.create(
                         model=MODEL,
                         reasoning={"effort": REASONING_EFFORT},
-                        input=[{"role": "system", "content": system_prompt()}, *filtered_inputs],
+                        input=[{"role": "system", "content": system_prompt(session)}, *filtered_inputs],
                         tools=TOOLING_SPEC,
                         max_output_tokens=2000,
                         stream=True,
@@ -652,7 +691,7 @@ async def run_agent_turn_async(
                     response = await async_client.responses.create(
                         model=MODEL,
                         reasoning={"effort": REASONING_EFFORT},
-                        input=[{"role": "system", "content": system_prompt()}, *filtered_inputs],
+                        input=[{"role": "system", "content": system_prompt(session)}, *filtered_inputs],
                         tools=TOOLING_SPEC,
                         max_output_tokens=2000,
                     )
@@ -660,7 +699,7 @@ async def run_agent_turn_async(
                     response = await async_client.responses.create(
                         model=MODEL,
                         reasoning={"effort": REASONING_EFFORT},
-                        input=[{"role": "system", "content": system_prompt()}, *filtered_inputs],
+                        input=[{"role": "system", "content": system_prompt(session)}, *filtered_inputs],
                         tools=TOOLING_SPEC,
                         max_output_tokens=2000,
                     )
@@ -687,18 +726,21 @@ async def run_agent_turn_async(
         input_tokens = int(getattr(usage, "input_tokens", 0) or 0) if usage else 0
         output_tokens = int(getattr(usage, "output_tokens", 0) or 0) if usage else 0
         session.total_tokens += input_tokens + output_tokens
+        session.total_tokens_lifetime += input_tokens + output_tokens
         yield {
             "type": "status",
             "stage": "model_call_complete",
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": session.total_tokens,
+            "lifetime_total_tokens": session.total_tokens_lifetime,
         }
         yield {
             "type": "token_usage",
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": session.total_tokens,
+            "lifetime_total_tokens": session.total_tokens_lifetime,
         }
 
         if session.total_tokens >= TOKEN_WATERMARK:
@@ -827,13 +869,25 @@ async def run_agent_turn_async(
 
         for evt in data_events:
             yield {"type": evt.get("type"), "payload": evt.get("payload")}
-        yield {"type": "reply", "text": reply_text, "status": "ok", "total_tokens": reply_tokens}
+        yield {
+            "type": "reply",
+            "text": reply_text,
+            "status": "ok",
+            "total_tokens": reply_tokens,
+            "lifetime_total_tokens": session.total_tokens_lifetime,
+        }
         reply_sent = True
         break
 
     if not reply_sent:
         fallback = reply_text if reply_text.strip() else "No content returned."
-        yield {"type": "reply", "text": fallback, "status": "ok", "total_tokens": reply_tokens}
+        yield {
+            "type": "reply",
+            "text": fallback,
+            "status": "ok",
+            "total_tokens": reply_tokens,
+            "lifetime_total_tokens": session.total_tokens_lifetime,
+        }
 
     if over_limit_after_turn:
         logger.info(
@@ -846,8 +900,8 @@ async def run_agent_turn_async(
     yield {"type": "status", "stage": "done"}
 
 
-def system_prompt() -> str:
-    return """You are Codex, a data analysis agent by Actalyst.
+def system_prompt(session: SessionState) -> str:
+    base = """You are Codex, a data analysis agent by Actalyst.
 
 DATA LOADING STRATEGY (follow this order):
 1. get_dataset_info(name) - Get schema (columns, dtypes, row_count) first
@@ -890,3 +944,14 @@ OTHER RULES:
 - Derived columns from computations are allowed; never fabricate data
 - Ask clarifying questions only when the user ask is very vague or unclear, and treat this as a last resort
 """
+    dataset_catalog = _dataset_catalog_context(session)
+    multi_dataset_rules = """
+
+MULTI-DATASET RULES:
+- Use the dataset inventory above as the first source of truth for dataset names/columns.
+- When multiple datasets exist and user did not name one, identify the most likely dataset before loading data.
+- Call list_datasets/get_dataset_info only if the inventory is missing or insufficient.
+- Prefer one brief clarification question if dataset choice is ambiguous.
+- Mention the chosen dataset name in the final response.
+"""
+    return f"{base}\n\n{dataset_catalog}\n{multi_dataset_rules}"
